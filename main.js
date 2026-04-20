@@ -1,0 +1,3260 @@
+// ==========================================
+// STATE & DATABASE CONFIG
+// ==========================================
+const STATE_KEY = 'tetherflow_data_v6';
+const BOT_APP_URL = 'https://t.me/JamronShopBot/app'; // ⚠️ ЗАМЕНИТЕ НА ВАШУ ССЫЛКУ WEB APP
+const BOT_LINK = 't.me/rollsshoptestbot'; // ⚠️ ССЫЛКА НА САМОГО БОТА (для рефералки)
+const MAIN_ADMIN_ID = 382175364; // ⚠️ ТЕЛЕГРАМ ID ГЛАВНОГО АДМИНА
+const CO_ADMINS = [5730406030]; // ⚠️ ID ДРУГИХ АДМИНОВ ЧЕРЕЗ ЗАПЯТУЮ (указывайте сколько угодно)
+const ADMIN_LIST = [MAIN_ADMIN_ID, ...CO_ADMINS];
+
+// ==========================================
+// MYSQL API FALLBACK (LOCAL FOR NOW)
+// ==========================================
+// Внимание: Фронтенд (браузер) не может напрямую подключаться к MySQL.
+// Временно данные сохраняются в localStorage (эмуляция базы данных).
+// Для реальной работы нужно будет сделать fetch-запросы к Node.js бэкенду (bot.js).
+
+const API_URL = 'https://webapp25.onrender.com/api'; // Подключено к вашему серверу MongoDB
+let isDbActive = true;
+
+// Взаимодействие строго с вашей MongoDB через API
+// Я убрал резервное сохранение в localStorage: теперь данные сохраняются только навсегда в базу
+const SettingsAPI = {
+  async get() {
+    try {
+      const res = await fetch(`${API_URL}/settings?_t=${Date.now()}`, { cache: 'no-store', headers: { 'Cache-Control': 'no-store, no-cache, must-revalidate' } });
+      if (!res.ok) throw new Error(`HTTP error: ${res.status}`);
+      const data = await res.json();
+      return data && data.data ? data.data : null;
+    } catch(e) {
+      console.warn('Settings API get Error:', e);
+      const local = await miniappsAI.storage.getItem('global_settings');
+      return local ? JSON.parse(local) : null;
+    }
+  },
+  async update(dataPayload) {
+    try { await miniappsAI.storage.setItem('global_settings', JSON.stringify(dataPayload)); } catch(err) {}
+    try {
+      const res = await fetch(`${API_URL}/settings`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store, no-cache, must-revalidate' },
+        body: JSON.stringify({ data: dataPayload })
+      });
+      const json = await res.json();
+      console.log('Settings API Update Success:', json);
+      return json;
+    } catch(e) {
+      console.warn('Settings API update Error:', e);
+      return { data: dataPayload };
+    }
+  }
+};
+
+const User = {
+  async findOne(q) {
+    if (q.id === undefined || q.id === null) return null;
+    try {
+      const res = await fetch(`${API_URL}/users/${q.id}?_t=${Date.now()}`, { cache: 'no-store', headers: { 'Cache-Control': 'no-store, no-cache, must-revalidate' } });
+      if (!res.ok) throw new Error(`HTTP error: ${res.status}`);
+      const data = await res.json();
+      return data && Object.keys(data).length > 0 ? data : null;
+    } catch(e) {
+      console.warn('DB findOne Error, trying local storage:', e);
+      const localData = await miniappsAI.storage.getItem(`db_user_${q.id}`);
+      return localData ? JSON.parse(localData) : null;
+    }
+  },
+  async find(q = {}) {
+    try {
+      const res = await fetch(`${API_URL}/users?_t=${Date.now()}`, { cache: 'no-store', headers: { 'Cache-Control': 'no-store, no-cache, must-revalidate' } });
+      if (!res.ok) throw new Error(`HTTP error: ${res.status}`);
+      return await res.json();
+    } catch(e) {
+      console.warn('DB find Error, returning local data:', e);
+      const localCurrent = await miniappsAI.storage.getItem(`db_user_${typeof currentUser !== 'undefined' && currentUser ? currentUser.id : 0}`);
+      const localGlobal = await miniappsAI.storage.getItem(`db_user_0`);
+      let list = [];
+      if(localGlobal) list.push(JSON.parse(localGlobal));
+      if(localCurrent && (!currentUser || currentUser.id !== 0)) list.push(JSON.parse(localCurrent));
+      return list;
+    }
+  },
+  async create(doc) {
+    try {
+      const res = await fetch(`${API_URL}/users`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store, no-cache, must-revalidate' },
+        body: JSON.stringify(doc)
+      });
+      return await res.json();
+    } catch(e) { console.error('DB create Error:', e); return doc; }
+  },
+  async updateOne(q, u) {
+    if (q.id === undefined || q.id === null) return null;
+    let dataPayload = u.$set && u.$set.data ? u.$set.data : (u.data ? u.data : u);
+    
+    // Always save locally as a backup
+    try { await miniappsAI.storage.setItem(`db_user_${q.id}`, JSON.stringify({ id: q.id, data: dataPayload })); } catch(err) {}
+    
+    try {
+      const res = await fetch(`${API_URL}/users/${q.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store, no-cache, must-revalidate' },
+        body: JSON.stringify({ data: dataPayload })
+      });
+      return await res.json();
+    } catch(e) {
+      console.warn('DB updateOne Error, saved locally:', e);
+      return { id: q.id, data: dataPayload };
+    }
+  },
+  async deleteOne(q) {
+    if (q.id === undefined || q.id === null) return null;
+    try { await miniappsAI.storage.removeItem(`db_user_${q.id}`); } catch(err) {}
+    try {
+      const res = await fetch(`${API_URL}/users/${q.id}`, { method: 'DELETE', headers: { 'Cache-Control': 'no-store, no-cache, must-revalidate' } });
+      return await res.json();
+    } catch(e) { console.error('DB deleteOne Error:', e); return { success: true }; }
+  }
+};
+
+// Global Application State (Дефолтные значения)
+let state = {
+  user: {
+    balance: 0.00,
+    totalEarned: 0.00,
+    isMinerActivated: false, // Флаг: активирован ли майнер за 3 USDT
+    uncollected: 0.00,  // Сколько намайнено, но еще не собрано
+    lastSync: Date.now(), // Время последней синхронизации майнинга
+    level: 1,
+    joinedDate: new Date().toISOString().split('T')[0],
+    status: 'active', // 'active' or 'banned'
+    invitedBy: null,
+    usedPromos: []
+  },
+  tasks: [],
+  friends: [],
+  withdrawals: [],
+  deposits: [], // Массив для истории пополнений
+  settings: {
+    minWithdrawal: 10,
+    refBonusPercent: 10,
+    refBonusFixed: 0.1,  // Фиксированный бонус за регистрацию реферала
+    miningRatePerHour: 0.01, // Базовая добыча в час (для 1 уровня)
+    maxMiningTimeHours: 24, // Лимит времени майнинга (часов)
+    upgradeBaseCost: 5,  // Базовая цена апгрейда
+    maintenanceMode: false,
+    tonWallet: 'EQAdminWalletTonkeeper123...', // Кошелек админа для Tonkeeper
+    bep20Wallet: '0xAdminWalletBsc123...' // Кошелек админа для BEP-20
+  },
+  admin: {
+    stats: { totalUsers: 0, dailyActive: 0, totalBalance: 0, totalPaid: 0 },
+    users: [],
+    pendingWithdrawals: [],
+    pendingDeposits: [], // Ожидающие одобрения пополнения
+    recentActivity: [],
+    promoCodes: []
+  }
+};
+
+// Для веба выдаем рандомный ID, чтобы не склеивались сессии
+let currentUser = null;
+let tonConnectUI = null;
+
+let currentTab = 'home';
+let currentAdminTab = 'dashboard';
+let isAdmin = false;
+let profileHistoryPage = 1;
+let friendsPage = 1;
+
+// DOM Elements
+const appContainer = document.getElementById('app');
+const adminAppContainer = document.getElementById('admin-app');
+const contentArea = document.getElementById('content-area');
+const adminContentArea = document.getElementById('admin-content-area');
+const headerBalance = document.getElementById('header-balance');
+const modalOverlay = document.getElementById('modal-overlay');
+const modalContent = document.getElementById('modal-content');
+const toast = document.getElementById('toast');
+const globalHeader = document.getElementById('app-header');
+
+// ==========================================
+// CACHE & DOM FIX (MODALS OVERLAY)
+// ==========================================
+function fixOverlaysHierarchy() {
+    const mo = document.getElementById('modal-overlay');
+    const to = document.getElementById('toast');
+    const bs = document.getElementById('block-screen');
+    if (mo && mo.parentElement !== document.body) document.body.appendChild(mo);
+    if (to && to.parentElement !== document.body) document.body.appendChild(to);
+    if (bs && bs.parentElement !== document.body) document.body.appendChild(bs);
+    if (mo) mo.style.zIndex = '99999';
+    if (to) to.style.zIndex = '999999';
+    if (bs) bs.style.zIndex = '9999999';
+}
+fixOverlaysHierarchy();
+
+// ==========================================
+// INITIALIZATION & DATABASE SYNC
+// ==========================================
+function parseTgData() {
+  let initDataUnsafe = {};
+  
+  if (window.Telegram?.WebApp?.initDataUnsafe && Object.keys(window.Telegram.WebApp.initDataUnsafe).length > 0) {
+    initDataUnsafe = JSON.parse(JSON.stringify(window.Telegram.WebApp.initDataUnsafe));
+  }
+  
+  try {
+    const source = window.location.hash.slice(1) || window.location.search.slice(1);
+    const params = new URLSearchParams(source);
+    const searchParams = new URLSearchParams(window.location.search);
+    
+    // 1. Безопасно достаем startapp из параметров URL (важно для кнопок Web App)
+    const startParam = searchParams.get('startapp') || params.get('startapp') || searchParams.get('tgWebAppStartParam') || params.get('tgWebAppStartParam') || searchParams.get('start_param');
+    if (startParam && !initDataUnsafe.start_param) {
+        initDataUnsafe.start_param = startParam;
+    }
+
+    // 2. Если пользователь не подгрузился из Telegram (открыто вне ТГ или баг кэша), парсим из URL
+    if (!initDataUnsafe.user) {
+        const tgWebAppData = params.get('tgWebAppData') || searchParams.get('tgWebAppData');
+        if (tgWebAppData) {
+          const dataParams = new URLSearchParams(tgWebAppData);
+          for (let [key, value] of dataParams.entries()) {
+            if (key === 'user') {
+              try { initDataUnsafe.user = JSON.parse(decodeURIComponent(value)); } catch(e){}
+            } else if (!initDataUnsafe[key]) {
+              initDataUnsafe[key] = decodeURIComponent(value);
+            }
+          }
+        }
+    }
+    
+    if (params.get('admin') === '1' || searchParams.get('admin') === '1') isAdmin = true;
+  } catch(e) { 
+    console.warn("Parse TG data error", e); 
+  }
+  
+  return initDataUnsafe;
+}
+
+async function initApp() {
+  if (!tonConnectUI && window.TON_CONNECT_UI) {
+      try {
+          tonConnectUI = new window.TON_CONNECT_UI.TonConnectUI({
+              manifestUrl: 'https://raw.githubusercontent.com/ton-community/tutorials/main/03-client/test/public/tonconnect-manifest.json'
+          });
+      } catch (e) { console.error("TonConnect init error", e); }
+  }
+
+  const tgData = parseTgData();
+  const tg = window.Telegram?.WebApp;
+  let isTgEnv = false;
+
+  if (tgData.user) {
+    isTgEnv = true;
+    currentUser = tgData.user;
+    try {
+      if(tg) { tg.ready(); tg.expand(); tg.setHeaderColor('#0a0a0f'); }
+      window.parent.postMessage(JSON.stringify({eventType: 'web_app_expand', eventData: ""}), '*');
+      window.parent.postMessage(JSON.stringify({eventType: 'web_app_ready', eventData: ""}), '*');
+    } catch(e) {}
+  } else {
+    // Web fallback using miniappsAI.storage
+    let localWebId = await miniappsAI.storage.getItem('local_web_id');
+    if (!localWebId) {
+      localWebId = Math.floor(Math.random() * 900000) + 100000;
+      await miniappsAI.storage.setItem('local_web_id', localWebId.toString());
+    }
+    currentUser = {
+      id: Number(localWebId),
+      first_name: 'Web',
+      last_name: 'User',
+      username: 'web_' + localWebId,
+      photo_url: 'https://api.dicebear.com/7.x/avataaars/svg?seed=' + localWebId
+    };
+  }
+
+  await loadState(tgData);
+  calculateOfflineMining();
+
+  const bootApp = () => {
+    if(!checkAccess()) return;
+    updateHeaderUI();
+    setupNavigation();
+    
+    if (ADMIN_LIST.includes(Number(currentUser.id)) || isAdmin) {
+      isAdmin = true;
+      document.getElementById('nav-admin').classList.remove('hidden');
+      document.getElementById('nav-admin').classList.add('flex');
+    }
+    setupAdminNavigation();
+    startMiningLoop(); // Запуск цикла облачного майнинга
+    renderTab(currentTab);
+  };
+
+  bootApp();
+}
+
+async function loadState(tgData) {
+   let globalSettings = null;
+   let globalTasks = [];
+   let globalPromos = [];
+
+   let globalData = await SettingsAPI.get();
+   if (!globalData || Object.keys(globalData).length === 0) {
+       globalData = { tasks: [], settings: state.settings, promoCodes: [] };
+       await SettingsAPI.update(globalData);
+   } else {
+       if (globalData.settings) globalSettings = globalData.settings;
+       if (globalData.tasks) globalTasks = globalData.tasks;
+       if (globalData.promoCodes) globalPromos = globalData.promoCodes;
+   }
+
+   let userDoc = await User.findOne({ id: currentUser.id });
+   
+   if (userDoc && userDoc.data && Object.keys(userDoc.data).length > 0) {
+      const dbData = userDoc.data;
+      
+      if (dbData.admin && dbData.admin.users) {
+          dbData.admin.users = [];
+          dbData.admin.pendingWithdrawals = [];
+          dbData.admin.pendingDeposits = [];
+      }
+
+      state.user = { ...state.user, ...dbData.user };
+      state.user.activeSkin = state.user.activeSkin || 'default';
+      state.user.unlockedSkins = state.user.unlockedSkins || ['default'];
+      state.user.achievements = state.user.achievements || [];
+      state.user.staking = state.user.staking || [];
+      state.user.squadId = state.user.squadId || null;
+      if (!state.squads) state.squads = [];
+      
+      state.tasks = globalTasks.map(gt => {
+          const userTask = (dbData.tasks || []).find(t => t.id === gt.id);
+          return userTask ? { ...gt, status: userTask.status } : { ...gt, status: 'todo' };
+      });
+      
+      state.friends = dbData.friends || [];
+      state.withdrawals = dbData.withdrawals || [];
+      state.deposits = dbData.deposits || [];
+      
+      if (!dbData.admin?.pendingDeposits) {
+          if (!state.admin.pendingDeposits) state.admin.pendingDeposits = [];
+      } else {
+          state.admin = { ...state.admin, ...dbData.admin };
+      }
+      
+      state.admin.promoCodes = globalPromos;
+      if (globalSettings) state.settings = { ...state.settings, ...globalSettings };
+      
+   } else {
+      state.tasks = globalTasks.map(gt => ({ ...gt, status: 'todo' }));
+      if (globalSettings) state.settings = { ...state.settings, ...globalSettings };
+      state.admin.promoCodes = globalPromos;
+          
+          // ВАЖНО: Присваиваем имя и данные юзера ДО того, как сохранить его первый раз в базу данных (чтобы инфа не терялась)
+          state.user.firstName = currentUser.first_name;
+          state.user.lastName = currentUser.last_name;
+          state.user.username = currentUser.username;
+          state.user.photoUrl = currentUser.photo_url;
+          
+          await registerNewUserInDb(tgData);
+   }
+   
+   state.user.firstName = currentUser.first_name;
+   state.user.lastName = currentUser.last_name;
+   state.user.username = currentUser.username;
+   state.user.photoUrl = currentUser.photo_url;
+}
+
+async function registerNewUserInDb(tgData) {
+   const refBonusFixed = state.settings.refBonusFixed !== undefined ? state.settings.refBonusFixed : 0.1;
+
+   if (tgData.start_param && String(tgData.start_param) !== String(currentUser.id)) {
+      const inviterId = Number(tgData.start_param);
+      state.user.invitedBy = inviterId;
+      try {
+          const inviterDoc = await User.findOne({ id: inviterId });
+          if (inviterDoc) {
+             const friends = inviterDoc.data.friends || [];
+             if (inviterDoc.data.user.balance === undefined) inviterDoc.data.user.balance = 0;
+             if (inviterDoc.data.user.totalEarned === undefined) inviterDoc.data.user.totalEarned = 0;
+
+             inviterDoc.data.user.balance += refBonusFixed;
+             inviterDoc.data.user.totalEarned += refBonusFixed;
+
+             friends.push({
+                 id: currentUser.id,
+                 name: currentUser.first_name,
+                 date: new Date().toISOString().split('T')[0],
+                 earned: refBonusFixed
+             });
+             inviterDoc.data.friends = friends;
+             await User.updateOne({ id: inviterId }, { $set: { data: inviterDoc.data } });
+             setTimeout(() => showToast(`🤝 Вы зарегистрировались по ссылке ID: ${inviterId}`), 1500);
+          } else {
+             console.warn("Inviter not found in Local DB.");
+          }
+      } catch(e) { console.error("Referral processing error", e); }
+   }
+   state.user.lastSync = Date.now();
+   await User.updateOne({ id: currentUser.id }, { $set: { data: state } });
+}
+
+async function saveState() {
+   try {
+      const stateToSave = { ...state };
+      if (stateToSave.admin) {
+          stateToSave.admin = { 
+              ...state.admin, 
+              users: [], 
+              pendingWithdrawals: [], 
+              pendingDeposits: [] 
+          };
+      }
+      await User.updateOne({ id: currentUser.id }, { $set: { data: stateToSave } });
+
+      if (isAdmin || (typeof ADMIN_LIST !== 'undefined' && ADMIN_LIST.includes(Number(currentUser.id)))) {
+          const globalData = {
+              settings: state.settings,
+              tasks: state.tasks.map(t => ({ ...t, status: 'todo', currentUses: t.currentUses || 0, maxUses: t.maxUses || 0 })),
+              promoCodes: state.admin.promoCodes
+          };
+          await SettingsAPI.update(globalData);
+      }
+   } catch (e) {
+      console.error("Failed to save state", e);
+   }
+}
+
+function checkAccess() {
+  const blockScreen = document.getElementById('block-screen');
+  const blockTitle = document.getElementById('block-title');
+  const blockMsg = document.getElementById('block-msg');
+  const blockIcon = document.getElementById('block-icon');
+
+  if (state.user.status === 'banned') {
+      blockTitle.textContent = 'Аккаунт заблокирован';
+      blockMsg.textContent = 'Администратор ограничил ваш доступ к приложению за нарушение правил.';
+      blockIcon.innerHTML = '<i class="fas fa-ban text-red-500 drop-shadow-[0_0_15px_rgba(239,68,68,0.5)]"></i>';
+      blockScreen.classList.remove('hidden');
+      blockScreen.classList.add('flex');
+      return false;
+  }
+  if (state.settings.maintenanceMode && !isAdmin) {
+      blockTitle.textContent = 'Техническое обслуживание';
+      blockMsg.textContent = 'Мы обновляем систему. Пожалуйста, зайдите немного позже.';
+      blockIcon.innerHTML = '<i class="fas fa-tools text-yellow-500 drop-shadow-[0_0_15px_rgba(234,179,8,0.5)]"></i>';
+      blockScreen.classList.remove('hidden');
+      blockScreen.classList.add('flex');
+      return false;
+  }
+  blockScreen.classList.add('hidden');
+  blockScreen.classList.remove('flex');
+  return true;
+}
+
+// ==========================================
+// MINING LOGIC
+// ==========================================
+function calculateOfflineMining() {
+    if (!state.user.isMinerActivated) return; // Майнинг не идет без активации
+    if (!state.user.lastSync) state.user.lastSync = Date.now();
+    if (state.user.uncollected === undefined) state.user.uncollected = 0;
+    
+    const now = Date.now();
+    const elapsedMs = now - state.user.lastSync;
+    const elapsedHours = elapsedMs / (1000 * 60 * 60);
+    
+    const ratePerHour = (state.settings.miningRatePerHour !== undefined ? state.settings.miningRatePerHour : 0.01) * state.user.level;
+    const maxHours = state.settings.maxMiningTimeHours !== undefined ? state.settings.maxMiningTimeHours : 24;
+    const maxCapacity = ratePerHour * maxHours;
+    
+    const mined = elapsedHours * ratePerHour;
+    if (mined > 0) {
+        state.user.uncollected += mined;
+    }
+    if (state.user.uncollected > maxCapacity) {
+        state.user.uncollected = maxCapacity;
+    }
+    state.user.lastSync = now;
+}
+
+function startMiningLoop() {
+  setInterval(() => {
+    if (!state.user.isMinerActivated) return; // Майнинг не идет без активации
+    const now = Date.now();
+    if (!state.user.lastSync) state.user.lastSync = now;
+    
+    const elapsedMs = now - state.user.lastSync;
+    const ratePerHour = (state.settings.miningRatePerHour !== undefined ? state.settings.miningRatePerHour : 0.01) * state.user.level;
+    const ratePerMs = ratePerHour / (1000 * 60 * 60);
+    
+    const maxHours = state.settings.maxMiningTimeHours !== undefined ? state.settings.maxMiningTimeHours : 24;
+    const maxCapacity = ratePerHour * maxHours;
+    
+    state.user.uncollected = (state.user.uncollected || 0) + (elapsedMs * ratePerMs);
+    let isFull = false;
+    if (state.user.uncollected >= maxCapacity) {
+        state.user.uncollected = maxCapacity;
+        isFull = true;
+    }
+    state.user.lastSync = now;
+    
+    // Update UI if on home tab
+    if (currentTab === 'home') {
+       const uncolEl = document.getElementById('uncollected-balance');
+  if (typeof startHomeParticles === 'function') startHomeParticles();
+       const statusEl = document.getElementById('mining-status-text');
+       if (uncolEl) {
+         uncolEl.textContent = state.user.uncollected.toFixed(6);
+         if (statusEl) {
+             if (isFull) {
+                 statusEl.innerHTML = '<span class="text-red-400 animate-pulse"><i class="fas fa-exclamation-triangle"></i> Хранилище заполнено</span>';
+                 uncolEl.classList.remove('from-white', 'to-teal-200');
+                 uncolEl.classList.add('from-red-100', 'to-red-500');
+             } else {
+                 statusEl.innerHTML = 'Намайнено';
+                 uncolEl.classList.remove('from-red-100', 'to-red-500');
+                 uncolEl.classList.add('from-white', 'to-teal-200');
+             }
+         }
+       }
+    }
+  }, 1000);
+
+  // Auto-save state to DB every 10 seconds
+  setInterval(() => {
+    saveState();
+  }, 10000);
+}
+
+function getUpgradeCost(currentLevel) {
+    if (currentLevel >= 10) return 0;
+    const baseCost = state.settings.upgradeBaseCost !== undefined ? state.settings.upgradeBaseCost : 5;
+    return (baseCost * Math.pow(1.5, currentLevel - 1)).toFixed(2);
+}
+
+// ==========================================
+// UTILITIES
+// ==========================================
+function updateHeaderUI() {
+  document.getElementById('user-name').className = "font-bold text-xs mb-0.5";
+  document.getElementById('user-id').className = "text-[9px] text-slate-400 leading-none";
+  
+  document.getElementById('user-name').textContent = `${currentUser.first_name} ${currentUser.last_name || ''}`.trim();
+  document.getElementById('user-id').textContent = `@${currentUser.username || currentUser.id}`;
+  
+  const initials = currentUser.first_name.charAt(0) + (currentUser.last_name ? currentUser.last_name.charAt(0) : '');
+  const avatarEl = document.getElementById('user-avatar');
+  avatarEl.className = " w-6 h-6 rounded-full bg-gradient-to-br from-teal-400 to-blue-500 flex items-center justify-center text-white font-bold text-[10px] border border-slate-700 shadow-sm cursor-pointer relative z-50 overflow-hidden";
+  if (currentUser.photo_url) {
+    avatarEl.innerHTML = `<img src="${currentUser.photo_url}" class="w-full h-full object-cover" alt="Avatar">`;
+  } else {
+    avatarEl.innerHTML = '';
+    avatarEl.textContent = initials;
+  }
+
+  headerBalance.textContent = `${state.user.balance.toFixed(2)} USDT`;
+}
+
+function triggerHaptic(style = 'light') {
+  if (window.Telegram?.WebApp?.HapticFeedback) {
+    try {
+      if (['error', 'success', 'warning'].includes(style)) {
+        window.Telegram.WebApp.HapticFeedback.notificationOccurred(style);
+      } else {
+        window.Telegram.WebApp.HapticFeedback.impactOccurred(style);
+      }
+    } catch (e) {
+      console.warn('Haptic error', e);
+    }
+  }
+}
+
+function showToast(message) {
+  toast.textContent = message;
+  toast.classList.remove('opacity-0', 'pointer-events-none', 'translate-y-[-20px]');
+  toast.classList.add('opacity-100', 'translate-y-0');
+  setTimeout(() => {
+    toast.classList.remove('opacity-100', 'translate-y-0');
+    toast.classList.add('opacity-0', 'pointer-events-none', 'translate-y-[-20px]');
+  }, 2500);
+}
+
+function showFloatingNumber(x, y, text) {
+  const el = document.createElement('div');
+  el.className = 'fixed text-teal-400 font-black text-xl z-50 pointer-events-none select-none drop-shadow-md animate-slide-up';
+  el.textContent = text;
+  el.style.left = `${x - 15}px`;
+  el.style.top = `${y - 25}px`;
+  el.style.transition = 'all 0.8s cubic-bezier(0.25, 1, 0.5, 1)';
+  document.body.appendChild(el);
+  el.getBoundingClientRect();
+  el.style.transform = `translateY(-60px) scale(1.3)`;
+  el.style.opacity = '0';
+  setTimeout(() => el.remove(), 800);
+}
+
+window.closeModal = () => {
+  modalContent.classList.remove('animate-pop-in');
+  modalOverlay.classList.add('opacity-0');
+  modalContent.classList.add('scale-95');
+  setTimeout(() => { modalOverlay.classList.add('hidden'); }, 300);
+};
+
+// ==========================================
+// NAVIGATION (MAIN APP)
+// ==========================================
+function setupNavigation() {
+  const navBtns = document.querySelectorAll('#app .nav-btn');
+  navBtns.forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      const tab = e.currentTarget.dataset.tab;
+      triggerHaptic('light');
+
+      // Animating the icon on tap
+      const target = e.currentTarget;
+      if(target) target.classList.add('animating');
+      setTimeout(() => { if(target) target.classList.remove('animating'); }, 400);
+
+      if (tab === 'admin') {
+        openAdminPanel();
+        return;
+      }
+      
+      navBtns.forEach(b => {
+        if(b.id !== 'nav-admin' || !isAdmin) {
+            b.classList.remove('text-teal-400', 'active');
+            b.classList.add('text-slate-400');
+        }
+      });
+      e.currentTarget.classList.remove('text-slate-400');
+      e.currentTarget.classList.add('text-teal-400', 'active');
+      
+      if (tab === 'profile') profileHistoryPage = 1;
+      if (tab === 'friends') friendsPage = 1;
+      currentTab = tab;
+      renderTab(tab);
+    });
+  });
+}
+
+function renderTab(tab) {
+  contentArea.innerHTML = '';
+  const container = document.createElement('div');
+  container.className = 'fade-in h-full';
+
+  // Скрываем общий хедер на главной, так как там есть свой кастомный
+  if (tab === 'home') {
+      globalHeader.classList.add('hidden');
+      globalHeader.classList.remove('flex');
+  } else {
+      globalHeader.classList.remove('hidden');
+      globalHeader.classList.add('flex');
+      updateHeaderUI();
+  }
+
+  switch (tab) {
+    case 'home': container.innerHTML = renderHome(); setTimeout(attachHomeEvents, 0); break;
+    case 'tasks': container.innerHTML = renderTasks(); setTimeout(attachTaskEvents, 0); break;
+    case 'friends': container.innerHTML = renderFriends(); setTimeout(attachFriendsEvents, 0); break;
+    case 'profile': container.innerHTML = renderProfile(); setTimeout(attachProfileEvents, 0); break;
+  }
+  contentArea.appendChild(container);
+}
+
+// ==========================================
+// MAIN APP VIEWS
+// ==========================================
+function renderHome() {
+  if (state.user.uncollected === undefined) state.user.uncollected = 0;
+  const activeSkinId = state.user.activeSkin || 'default';
+  const skin = (window.SKINS && window.SKINS.find(s => s.id === activeSkinId)) || { id: 'default', name: 'Оригинал', cost: 0, icon: 'fa-dharmachakra', colors: 'from-slate-800 to-slate-900', ring: 'border-t-teal-400', iconColor: 'text-teal-400' };
+  const avatar = currentUser.photo_url 
+    ? '<img src="' + currentUser.photo_url + '" class="w-full h-full object-cover" alt="Avatar">' 
+    : (currentUser.first_name.charAt(0) + (currentUser.last_name ? currentUser.last_name.charAt(0) : ''));
+  const ratePerHour = (state.settings.miningRatePerHour !== undefined ? state.settings.miningRatePerHour : 0.01) * state.user.level;
+  const maxCapacity = ratePerHour * (state.settings.maxMiningTimeHours !== undefined ? state.settings.maxMiningTimeHours : 24);
+  const hashrate = state.user.level * 100;
+  const levelProgress = Math.min(100, (state.user.level / 10) * 100);
+
+  return `
+    <div class="flex flex-col h-full pt-3 pb-6 px-4 relative bg-[#0a0a0f] overflow-y-auto hide-scrollbar z-0">
+      
+      <!-- MEGA BEAUTIFUL BACKGROUND -->
+      <div class="absolute inset-0 overflow-hidden pointer-events-none -z-10">
+         <div class="absolute -top-[20%] -left-[10%] w-[70%] h-[50%] bg-teal-500/10 rounded-full blur-[100px] animate-[pulse_6s_ease-in-out_infinite]"></div>
+         <div class="absolute top-[30%] -right-[20%] w-[60%] h-[60%] bg-blue-600/10 rounded-full blur-[120px] animate-[pulse_8s_ease-in-out_infinite]"></div>
+         <div class="absolute -bottom-[10%] left-[10%] w-[50%] h-[40%] bg-purple-500/10 rounded-full blur-[90px] animate-[pulse_7s_ease-in-out_infinite]"></div>
+         <div class="absolute inset-0 bg-[url('data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjAiIGhlaWdodD0iMjAiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PGNpcmNsZSBjeD0iMSIgY3k9IjEiIHI9IjEiIGZpbGw9InJnYmEoMjU1LDI1NSwyNTUsMC4wMykiLz48L3N2Zz4=')] opacity-50"></div>
+         <div id="particles-layer" class="absolute inset-0 z-0 overflow-hidden pointer-events-none"></div>
+      </div>
+
+      <!-- TOP HEADER (Profile & Live Feed) -->
+      <div class="flex flex-col space-y-3 mb-4 shrink-0 animate-slide-up relative z-10">
+        <!-- Live Feed Ticker -->
+        <div class="w-full bg-slate-900/60 backdrop-blur-md border border-slate-700/50 py-1.5 px-3 rounded-xl overflow-hidden relative flex items-center shadow-lg">
+          <div class="w-6 h-6 rounded-full bg-teal-500/20 flex items-center justify-center mr-2 shrink-0 border border-teal-500/30">
+            <i class="fas fa-satellite-dish text-teal-400 text-[10px] animate-ping opacity-75 absolute"></i>
+            <i class="fas fa-satellite-dish text-teal-400 text-[10px] relative z-10"></i>
+          </div>
+          <div class="flex-1 overflow-hidden relative h-4">
+            <div class="absolute whitespace-nowrap text-[10px] text-slate-300 font-medium animate-[marquee_20s_linear_infinite]" id="live-feed">
+              <span class="mx-4"><span class="text-white">@alex***</span> вывел <span class="text-teal-400 font-bold">15.50 USDT</span></span>
+              <span class="mx-4"><span class="text-white">@kris***</span> вывел <span class="text-teal-400 font-bold">5.00 USDT</span></span>
+              <span class="mx-4"><span class="text-white">@max***</span> вывел <span class="text-teal-400 font-bold">42.10 USDT</span></span>
+              <span class="mx-4"><span class="text-white">@ivan***</span> вывел <span class="text-teal-400 font-bold">11.00 USDT</span></span>
+            </div>
+          </div>
+        </div>
+
+        <!-- User Mini Profile -->
+        <div class=" flex items-center justify-between bg-slate-800/40 backdrop-blur-xl p-2.5 rounded-2xl border border-slate-700/50 shadow-xl tap-effect">
+          <div class="flex items-center space-x-3">
+            <div class="w-10 h-10 rounded-full bg-gradient-to-tr from-teal-400 to-blue-500 p-[2px] shadow-[0_0_15px_rgba(45,212,191,0.3)]">
+              <div class="w-full h-full rounded-full bg-slate-900 overflow-hidden border-2 border-slate-900 flex items-center justify-center text-white font-bold text-xs">
+                ${avatar}
+              </div>
+            </div>
+            <div class="flex flex-col">
+              <span class="text-white font-black text-sm tracking-wide drop-shadow-md">${currentUser.first_name}</span>
+              <span class="text-slate-400 text-[10px] font-medium bg-slate-900/50 px-1.5 py-0.5 rounded inline-block w-max mt-0.5 border border-slate-800">Майнер PRO</span> 
+            </div>
+          </div>
+          <div class="text-right px-3 py-1.5 bg-slate-900/60 rounded-xl border border-slate-700/50 shadow-inner">
+            <p class="text-[9px] text-slate-500 font-bold uppercase tracking-widest mb-0.5">Баланс</p>
+            <p class="text-teal-400 font-black text-sm drop-shadow-sm leading-none"><span id="main-balance">${state.user.balance.toFixed(2)}</span> <span class="text-[9px] text-teal-500 align-top">USDT</span></p>
+          </div>
+        </div>
+      </div>
+
+      <!-- MEGA BEAUTIFUL MINER CORE VISUAL -->
+      <div class="flex-1 flex flex-col items-center justify-center relative w-full min-h-[300px] animate-slide-up delay-75 shrink-0 my-2">
+        <div class="relative w-full flex items-center justify-center float-anim group">
+          
+          <!-- Outer Pulsing Aura -->
+          <div class="absolute w-72 h-72 rounded-full bg-teal-500/5 blur-2xl group-hover:bg-teal-500/10 transition-colors duration-700"></div>
+
+          <!-- Futuristic Outer Rings -->
+          <div class="absolute w-[280px] h-[280px] rounded-full border border-slate-700/30 border-dashed pointer-events-none" style="animation: spin-slow 30s linear infinite;"></div>
+          <div class="absolute w-[240px] h-[240px] rounded-full border-t border-l border-teal-500/30 pointer-events-none shadow-[0_0_30px_rgba(20,184,166,0.1)]" style="animation: spin-slow 20s linear infinite reverse;"></div>
+          <div class="absolute w-[200px] h-[200px] rounded-full border-b border-r border-blue-500/30 pointer-events-none" style="animation: spin-slow 15s linear infinite;"></div>
+          
+          <!-- Middle Accent Ring -->
+          <div class="absolute w-48 h-48 rounded-full border border-slate-700/80 ${skin.ring} pointer-events-none shadow-[0_0_20px_rgba(45,212,191,0.2)] ${state.user.isMinerActivated ? 'pulse-ring-anim' : ''}"></div>
+          
+          <!-- Core Miner Container (3D Glassmorphism effect) -->
+          <div class="relative z-10 w-[170px] h-[170px] rounded-full bg-gradient-to-br ${skin.colors} p-1 shadow-[0_0_50px_rgba(0,0,0,0.8),inset_0_0_20px_rgba(255,255,255,0.1)] flex flex-col items-center justify-center overflow-hidden" style="-webkit-mask-image: -webkit-radial-gradient(white, black);">
+            <div class="absolute inset-0 bg-black/40 rounded-full"></div>
+            
+            <!-- Inner Animated Core -->
+            <div class="absolute inset-0 flex items-center justify-center opacity-40" style="transform: translateZ(0);">
+              <i class="fas ${skin.icon} text-[12rem] ${skin.iconColor} blur-[2px]" style="${state.user.isMinerActivated ? 'animation: spin-slow 8s linear infinite;' : 'opacity:0;'}"></i>
+            </div>
+            <div class="absolute inset-0 flex items-center justify-center opacity-90" style="transform: translateZ(0);">
+              <i class="fas ${skin.icon} text-[9rem] ${skin.iconColor} drop-shadow-[0_0_15px_currentColor]" style="${state.user.isMinerActivated ? 'animation: spin-slow 8s linear infinite;' : 'opacity:0.2;'}"></i>
+            </div>
+            
+            <!-- Dark Overlay for text contrast -->
+            <div class="absolute inset-0 bg-gradient-to-t from-slate-900 via-slate-900/60 to-transparent opacity-90 rounded-full"></div>
+            
+            <!-- Text Content -->
+            <div class="relative z-20 flex flex-col items-center justify-end h-full pb-4 px-2 text-center w-full">
+              <div class="w-8 h-8 rounded-full bg-slate-900/80 border border-slate-700 flex items-center justify-center mb-1 shadow-inner relative">
+                ${state.user.isMinerActivated ? '<div class="absolute inset-0 bg-teal-500/20 rounded-full animate-ping"></div><i class="fas fa-bolt text-teal-400 drop-shadow-[0_0_5px_rgba(45,212,191,0.8)] text-sm relative z-10"></i>' : '<i class="fas fa-lock text-slate-500 text-sm"></i>'}
+              </div>
+              <p id="mining-status-text" class="text-slate-300 text-[8px] uppercase tracking-widest mb-0.5 font-bold drop-shadow-md">${state.user.isMinerActivated ? 'Намайнено' : 'Ожидает активации'}</p>
+              
+              <!-- Mining Numbers -->
+              <div class="relative">
+                 <span class="text-3xl font-black font-mono text-transparent bg-clip-text bg-gradient-to-b from-white to-teal-200 tracking-tight transition-all" id="uncollected-balance">${state.user.isMinerActivated ? state.user.uncollected.toFixed(6) : '0.000000'}</span>
+              </div>
+              
+              <div class="flex items-center space-x-1 mt-1">
+                <span class="text-[9px] text-teal-400 font-black uppercase tracking-wider bg-teal-500/10 px-2 py-0.5 rounded border border-teal-500/20 shadow-inner backdrop-blur-sm">USDT</span>
+              </div>
+            </div>
+          </div>
+          
+          <!-- Capacity Indicator Floating Badge -->
+          <div class="absolute -bottom-4 left-1/2 transform -translate-x-1/2 bg-slate-900/90 backdrop-blur-md px-3 py-1.5 rounded-xl border border-slate-700 shadow-xl flex items-center space-x-2 z-20 w-max">
+             <i class="fas fa-battery-half text-slate-400 text-[10px]"></i>
+             <div class="text-[9px] text-slate-300 font-mono">Макс: <span class="text-white font-bold">${maxCapacity.toFixed(4)}</span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ACTION BUTTONS SECTION -->
+      <div class="animate-slide-up delay-150 w-full mb-4 shrink-0 mt-6 relative z-10">
+        ${!state.user.isMinerActivated ? `
+        <button id="activate-miner-btn" class="w-full py-4 bg-gradient-to-r from-pink-600 to-rose-500 hover:from-pink-500 hover:to-rose-400 text-white rounded-2xl font-black text-sm shadow-[0_10px_30px_rgba(225,29,72,0.3)] tap-effect uppercase tracking-widest relative overflow-hidden group border border-pink-400/50 flex flex-col items-center justify-center">
+          <div class="absolute inset-0 bg-[url('data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjAiIGhlaWdodD0iMjAiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PGNpcmNsZSBjeD0iMSIgY3k9IjEiIHI9IjEiIGZpbGw9InJnYmEoMjU1LDI1NSwyNTUsMC4xKSIvPjwvc3ZnPg==')] opacity-50"></div>
+          <div class="absolute inset-0 bg-white/20 transform -skew-x-12 -translate-x-full group-hover:animate-[shimmer_1.5s_infinite]"></div>
+          <span class="relative z-10 flex items-center drop-shadow-md text-base mb-0.5">
+            <i class="fas fa-rocket mr-2 animate-bounce"></i> Запустить майнер
+          </span>
+          <span class="relative z-10 text-[9px] text-pink-100/80 bg-black/20 px-2 py-0.5 rounded uppercase tracking-wider">Цена: 3 USDT</span>
+        </button>
+        ` : `
+        <button id="collect-btn" class="w-full py-4 bg-gradient-to-r from-teal-500 via-emerald-500 to-blue-500 hover:from-teal-400 hover:to-blue-400 text-white rounded-2xl font-black text-base shadow-[0_10px_30px_rgba(20,184,166,0.3)] tap-effect uppercase tracking-widest relative overflow-hidden group border border-teal-300/50 bg-[length:200%_auto] animate-[gradient_3s_ease_infinite]">
+          <div class="absolute inset-0 bg-[url('data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjAiIGhlaWdodD0iMjAiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PGNpcmNsZSBjeD0iMSIgY3k9IjEiIHI9IjEiIGZpbGw9InJnYmEoMjU1LDI1NSwyNTUsMC4xKSIvPjwvc3ZnPg==')] opacity-50"></div>
+          <div class="absolute inset-0 bg-white/20 transform -skew-x-12 -translate-x-full group-hover:animate-[shimmer_1.5s_infinite]"></div>
+          <span class="relative z-10 flex items-center justify-center drop-shadow-[0_2px_4px_rgba(0,0,0,0.5)]">
+            <i class="fas fa-hand-holding-usd mr-2 text-xl drop-shadow-md"></i> Собрать прибыль
+          </span>
+        </button>
+        `}
+      </div>
+
+      <!-- PREMIUM STATS & UPGRADE PANEL -->
+      <div class="w-full mt-auto bg-slate-800/60 p-4 rounded-3xl border border-slate-700/50 backdrop-blur-2xl shadow-2xl animate-slide-up delay-225 shrink-0 relative z-10 overflow-hidden group">
+        <div class="absolute inset-0 bg-gradient-to-br from-blue-500/5 to-teal-500/5 pointer-events-none opacity-0 group-hover:opacity-100 transition-opacity"></div>
+        
+        <div class="flex justify-between items-center mb-4 relative z-10">
+          <div class="flex items-center space-x-3">
+            <div class="w-12 h-12 rounded-2xl bg-gradient-to-br from-slate-700 to-slate-800 border border-slate-600 flex items-center justify-center text-teal-400 shadow-inner relative overflow-hidden">
+              <i class="fas fa-server text-xl relative z-10 drop-shadow-md"></i>
+              <div class="absolute bottom-0 w-full bg-teal-500/20" style="height: ${levelProgress}%"></div>
+            </div>
+            <div>
+              <p class="text-white font-black text-base drop-shadow-sm leading-none mb-1">${hashrate} <span class="text-xs text-slate-400 font-bold">GH/s</span></p>
+              <div class="flex items-center space-x-2">
+                 <p class="text-teal-400 bg-teal-500/10 px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider font-bold border border-teal-500/20">Ур. ${state.user.level} / 10</p>
+                 <span class="text-[9px] text-slate-500 font-mono">+${ratePerHour.toFixed(3)}/ч</span>
+              </div>
+            </div>
+          </div>
+          <div class="text-right">
+             <button onclick="window.openSkinsModal()" class="w-10 h-10 bg-slate-900/80 hover:bg-slate-800 text-pink-400 rounded-xl font-bold transition-colors tap-effect flex justify-center items-center border border-slate-700 shadow-inner group-hover:border-pink-500/30">
+               <i class="fas fa-paint-brush"></i>
+             </button>
+          </div>
+        </div>
+        
+        <div class="relative z-10">
+          <button id="upgrade-btn" class="w-full py-3.5 bg-slate-900/80 hover:bg-slate-800 text-white rounded-xl font-black text-xs transition-colors tap-effect flex justify-between items-center px-4 border border-slate-600/50 shadow-inner disabled:opacity-50 disabled:cursor-not-allowed group/btn relative overflow-hidden" ${state.user.level >= 10 ? 'disabled' : ''}>
+            <div class="absolute inset-0 bg-gradient-to-r from-teal-500/0 via-teal-500/10 to-teal-500/0 transform -translate-x-full group-hover/btn:animate-[shimmer_2s_infinite]"></div>
+            ${state.user.level >= 10 
+              ? '<span class="mx-auto flex items-center text-yellow-400"><i class="fas fa-crown mr-2"></i> Максимальный уровень</span>' 
+              : `<span class="flex items-center text-slate-300"><i class="fas fa-arrow-circle-up text-teal-400 mr-2 text-lg group-hover/btn:-translate-y-1 transition-transform"></i> Улучшить мощность</span> 
+                 <span class="bg-teal-500 text-slate-900 px-3 py-1 rounded-lg text-[11px] border border-teal-400 shadow-[0_0_10px_rgba(20,184,166,0.3)]">${getUpgradeCost(state.user.level)} USDT</span>`}
+          </button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function attachHomeEvents() {
+  const collectBtn = document.getElementById('collect-btn');
+  const activateBtn = document.getElementById('activate-miner-btn');
+  const upgradeBtn = document.getElementById('upgrade-btn');
+  const mainBalance = document.getElementById('main-balance');
+  const uncolEl = document.getElementById('uncollected-balance');
+  if (typeof startHomeParticles === 'function') startHomeParticles();
+
+  if (activateBtn) {
+    activateBtn.addEventListener('click', () => {
+      const cost = 3.00;
+      if (state.user.balance >= cost) {
+        triggerHaptic('heavy');
+        state.user.balance -= cost;
+        state.user.isMinerActivated = true;
+        state.user.lastSync = Date.now(); // Время добычи пойдет с этой секунды
+        saveState();
+        showToast('🚀 Майнер успешно активирован!');
+        renderTab('home');
+      } else {
+        triggerHaptic('error');
+        showToast(`Недостаточно средств. Нужно еще ${(cost - state.user.balance).toFixed(2)} USDT`);
+      }
+    });
+  }
+
+  if (collectBtn) collectBtn.addEventListener('click', (e) => {
+    if (state.user.uncollected < 0.00001) {
+       showToast("Пока нечего собирать!");
+       triggerHaptic('error');
+       return;
+    }
+    
+    triggerHaptic('success');
+    const amount = state.user.uncollected;
+    
+    state.user.balance += amount;
+    state.user.totalEarned += amount;
+    state.user.uncollected = 0;
+    state.user.lastSync = Date.now();
+
+    // Реферальная система (% от сбора)
+    if (state.user.invitedBy) {
+       const refBonus = amount * ((state.settings.refBonusPercent || 10) / 100);
+       User.findOne({ id: Number(state.user.invitedBy) }).then(invRes => {
+           if (invRes && invRes.data) {
+               if (invRes.data.user.balance === undefined) invRes.data.user.balance = 0;
+               if (invRes.data.user.totalEarned === undefined) invRes.data.user.totalEarned = 0;
+
+               invRes.data.user.balance += refBonus;
+               invRes.data.user.totalEarned += refBonus;
+               const meInFriends = invRes.data.friends.find(f => String(f.id) === String(currentUser.id));
+               if(meInFriends) meInFriends.earned += refBonus;
+               User.updateOne({ id: Number(state.user.invitedBy) }, { $set: { data: invRes.data } });
+           }
+       });
+    } 
+    else if (state.friends.length > 0 && !isDbActive && Math.random() < 0.2) {
+       // Офлайн симуляция для демо
+       const f = state.friends[Math.floor(Math.random() * state.friends.length)];
+       const refBonus = amount * ((state.settings.refBonusPercent || 10) / 100);
+       f.earned += refBonus;
+       state.user.balance += refBonus;
+       state.user.totalEarned += refBonus;
+       showToast(`Реф. бонус от ${f.name}: +${refBonus.toFixed(4)} USDT`);
+    }
+
+    // Smooth counter update
+    mainBalance.textContent = state.user.balance.toFixed(2);
+    uncolEl.style.transform = 'scale(0.8)';
+    uncolEl.style.opacity = '0.5';
+    setTimeout(() => {
+        uncolEl.textContent = '0.000000';
+        uncolEl.style.transform = 'scale(1)';
+        uncolEl.style.opacity = '1';
+    }, 150);
+    
+    headerBalance.textContent = `${state.user.balance.toFixed(2)} USDT`;
+    
+    showFloatingNumber(e.clientX || window.innerWidth/2, e.clientY || window.innerHeight/2, `+${amount.toFixed(4)}`);
+    if (typeof spawnCoins === 'function') spawnCoins(e.clientX || window.innerWidth/2, e.clientY || window.innerHeight/2, mainBalance);
+    saveState();
+  });
+
+  upgradeBtn.addEventListener('click', () => {
+    if (state.user.level >= 10) return;
+    
+    const cost = parseFloat(getUpgradeCost(state.user.level));
+    if (state.user.balance >= cost) {
+      triggerHaptic('heavy');
+      state.user.balance -= cost;
+      state.user.level += 1;
+      
+      calculateOfflineMining(); 
+      saveState();
+      
+      showToast(`⚡ Оборудование улучшено до уровня ${state.user.level}!`);
+      renderTab('home'); 
+    } else {
+      triggerHaptic('error');
+      showToast(`Недостаточно средств. Нужно еще ${(cost - state.user.balance).toFixed(2)} USDT`);
+    }
+  });
+}
+
+function renderTasks() {
+  let html = `
+    <div class="px-4 pt-4 pb-6 h-full overflow-y-auto hide-scrollbar">
+      <!-- MEGA BEAUTIFUL HERO BANNER -->
+      <div class="relative rounded-[2rem] p-6 mb-5 overflow-hidden shadow-2xl border border-white/10 animate-slide-up group" style="background: radial-gradient(circle at top left, #1e3a8a, #0f172a);">
+        <!-- Animated abstract shapes -->
+        <div class="absolute -right-10 -top-10 w-48 h-48 bg-teal-500/20 rounded-full blur-3xl pointer-events-none group-hover:bg-teal-500/30 transition-colors duration-700"></div>
+        <div class="absolute -left-10 -bottom-10 w-40 h-40 bg-blue-500/20 rounded-full blur-3xl pointer-events-none group-hover:bg-blue-500/30 transition-colors duration-700"></div>
+        
+        <div class="relative z-10 flex flex-col items-center text-center">
+          <div class="w-20 h-20 mb-4 bg-gradient-to-tr from-blue-500 to-teal-400 rounded-full flex items-center justify-center shadow-[0_0_30px_rgba(45,212,191,0.4)] border-4 border-slate-900/50 float-anim relative">
+            <i class="fas fa-rocket text-4xl text-white drop-shadow-lg transform -rotate-12 group-hover:rotate-12 transition-transform duration-500"></i>
+            <div class="absolute -bottom-1 -left-1 w-6 h-6 bg-yellow-400 rounded-full border-2 border-slate-900 flex items-center justify-center animate-bounce shadow-sm delay-150">
+              <i class="fas fa-bolt text-[10px] text-yellow-900"></i>
+            </div>
+          </div>
+          <h2 class="text-2xl font-black text-transparent bg-clip-text bg-gradient-to-r from-white to-blue-200 tracking-tight mb-2">Миссии</h2>
+          <p class="text-blue-100/80 text-[11px] leading-relaxed max-w-[220px]">
+            Выполняй задания и получай <span class="bg-white/10 text-white font-bold px-1.5 py-0.5 rounded shadow-sm">USDT</span> прямо на баланс!
+          </p>
+        </div>
+      </div>
+
+      <!-- HEADER WITH ACHIEVEMENTS BTN -->
+      <div class="flex justify-between items-end mb-4 px-1 animate-slide-up delay-75">
+        <h3 class="font-bold text-white text-sm">Доступные задания</h3>
+        <button onclick="window.openAchievementsModal()" class="text-[10px] bg-gradient-to-r from-yellow-500 to-orange-500 text-slate-900 px-3 py-1.5 rounded-xl font-black shadow-[0_0_15px_rgba(234,179,8,0.3)] tap-effect hover:scale-105 transition-transform flex items-center uppercase tracking-wide">
+          <i class="fas fa-medal mr-1.5 text-yellow-100"></i> Ачивки
+        </button>
+      </div>
+      
+      <div class="space-y-3.5 pb-20">
+  `;
+
+  if(state.tasks.length === 0) {
+      html += `
+        <div class="animate-slide-up delay-150 text-center py-12 bg-slate-800/40 backdrop-blur-xl rounded-3xl border border-slate-700/50 shadow-inner relative overflow-hidden">
+          <div class="absolute inset-0 bg-gradient-to-b from-transparent to-slate-900/80 pointer-events-none"></div>
+          <div class="w-16 h-16 mx-auto bg-slate-900 rounded-full flex items-center justify-center mb-4 text-slate-600 shadow-inner border border-slate-800 relative z-10">
+            <i class="fas fa-check-double text-2xl"></i>
+          </div>
+          <h3 class="text-white font-bold text-sm mb-1 relative z-10">Всё выполнено!</h3>
+          <p class="text-slate-500 text-[10px] px-8 relative z-10">Вы сделали все доступные задания.<br>Новые появятся совсем скоро.</p>
+        </div>
+      `;
+  }
+
+  state.tasks.forEach((task, index) => {
+    const delay = 150 + (index * 75);
+    let statusBadge = ''; let btnClass = ''; let btnText = '';
+    let isFull = task.maxUses > 0 && (task.currentUses || 0) >= task.maxUses;
+    let isDisabled = false;
+    let cardBorder = 'border-slate-700/50';
+    let cardHover = 'hover:border-blue-500/40';
+
+    if (isFull && task.status !== 'completed' && task.status !== 'checking' && task.status !== 'verify') {
+      statusBadge = '<span class="px-2 py-0.5 bg-red-500/10 text-red-400 text-[9px] rounded-md font-bold border border-red-500/20 uppercase tracking-widest"><i class="fas fa-ban mr-1"></i>Мест нет</span>';
+      btnClass = 'bg-slate-800 text-slate-500 cursor-not-allowed border border-slate-700';
+      btnText = 'Завершено';
+      isDisabled = true;
+    } else if (task.status === 'todo') {
+      statusBadge = '<span class="px-2 py-0.5 bg-blue-500/10 text-blue-400 text-[9px] rounded-md font-bold border border-blue-500/20 uppercase tracking-widest"><i class="fas fa-star mr-1"></i>Новое</span>';
+      btnClass = 'bg-gradient-to-r from-teal-500 to-blue-500 text-white hover:from-teal-400 hover:to-blue-400 shadow-[0_5px_15px_rgba(20,184,166,0.3)] border border-teal-400/50';
+      btnText = 'Начать';
+    } else if (task.status === 'verify') {
+      statusBadge = '<span class="px-2 py-0.5 bg-purple-500/10 text-purple-400 text-[9px] rounded-md font-bold border border-purple-500/20 uppercase tracking-widest">Проверить</span>';
+      btnClass = 'bg-purple-500 text-white hover:bg-purple-400 shadow-[0_5px_15px_rgba(168,85,247,0.3)] border border-purple-400/50';
+      btnText = 'Проверить';
+      cardBorder = 'border-purple-500/30';
+      cardHover = 'hover:border-purple-500/60';
+    } else if (task.status === 'checking') {
+      statusBadge = '<span class="px-2 py-0.5 bg-yellow-500/10 text-yellow-400 text-[9px] rounded-md font-bold border border-yellow-500/20 uppercase tracking-widest">В процессе</span>';
+      btnClass = 'bg-slate-800 text-slate-400 cursor-not-allowed border border-slate-700';
+      btnText = '<i class="fas fa-circle-notch fa-spin text-lg"></i>';
+      cardBorder = 'border-yellow-500/30';
+    } else if (task.status === 'completed') {
+      statusBadge = '<span class="px-2 py-0.5 bg-teal-500/10 text-teal-400 text-[9px] rounded-md font-bold border border-teal-500/20 uppercase tracking-widest">Выполнено</span>';
+      btnClass = 'bg-teal-500/10 text-teal-400 cursor-not-allowed border border-teal-500/30';
+      btnText = '<i class="fas fa-check text-lg"></i>';
+      cardBorder = 'border-teal-500/30 bg-teal-500/5';
+      cardHover = '';
+    }
+
+    html += `
+      <div class="animate-slide-up bg-slate-800/60 backdrop-blur-xl rounded-[1.25rem] p-4 flex items-center justify-between border ${cardBorder} shadow-sm transition-all tap-effect ${cardHover} group relative overflow-hidden" style="animation-delay: ${delay}ms">
+        <div class="absolute inset-0 bg-gradient-to-r from-blue-500/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none"></div>
+
+        <div class="flex items-center space-x-4 w-full relative z-10 pr-3">
+          <div class="w-14 h-14 rounded-2xl bg-slate-900 flex items-center justify-center text-3xl text-white shadow-inner shrink-0 border border-slate-700/80 group-hover:scale-105 transition-transform duration-300 relative overflow-hidden">
+            <div class="absolute inset-0 bg-gradient-to-tr from-transparent via-white/5 to-transparent pointer-events-none"></div>
+            <i class="fab ${task.icon} text-transparent bg-clip-text bg-gradient-to-br from-blue-400 to-teal-400 drop-shadow-sm"></i>
+          </div>
+          <div class="min-w-0 flex-1">
+            <h3 class="font-black text-[13px] text-white mb-1.5 truncate w-full tracking-wide" title="${task.title}">${task.title}</h3>
+            <div class="flex items-center space-x-2 flex-wrap gap-y-1">
+              <span class="text-white font-black text-[11px] bg-slate-900/80 px-2 py-0.5 rounded-lg border border-slate-700 shadow-inner flex items-center">
+                <span class="text-teal-400 mr-1">+${task.reward.toFixed(2)}</span> <span class="text-[9px] text-slate-500">USDT</span>
+              </span>
+              ${statusBadge}
+            </div>
+          </div>
+        </div>
+        <button class="task-action-btn w-24 py-3 rounded-xl font-black text-[11px] transition-all shrink-0 ml-1 relative z-10 uppercase tracking-wider flex justify-center items-center ${btnClass}" data-id="${task.id}" ${isDisabled || ['checking', 'completed'].includes(task.status) ? 'disabled' : ''}>
+          ${btnText}
+        </button>
+      </div>
+    `;
+  });
+
+  html += `</div></div>`;
+  return html;
+}
+
+function attachTaskEvents() {
+  document.querySelectorAll('.task-action-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      const taskId = e.currentTarget.dataset.id;
+      const taskIndex = state.tasks.findIndex(t => t.id === taskId);
+      if (taskIndex === -1) return;
+
+      const task = state.tasks[taskIndex];
+      triggerHaptic('medium');
+
+      if (task.status === 'todo') {
+        if (window.Telegram?.WebApp && task.type === 'tg') {
+          window.Telegram.WebApp.openTelegramLink(task.url);
+        } else {
+          window.open(task.url, '_blank');
+        }
+        state.tasks[taskIndex].status = 'verify';
+        saveState();
+        renderTab('tasks');
+        return;
+      }
+
+      if (task.status === 'verify') {
+        state.tasks[taskIndex].status = 'checking';
+        saveState();
+        renderTab('tasks');
+
+        setTimeout(() => {
+          const isSuccess = Math.random() > 0.2; // 80% success
+          if (isSuccess) {
+            state.tasks[taskIndex].status = 'completed';
+            state.user.balance += state.tasks[taskIndex].reward;
+            state.user.totalEarned += state.tasks[taskIndex].reward;
+
+                        // Global counter increment
+            SettingsAPI.get().then(globalData => {
+               if(globalData && globalData.tasks) {
+                   const gTask = globalData.tasks.find(t => t.id === taskId);
+                   if(gTask) {
+                       gTask.currentUses = (gTask.currentUses || 0) + 1;
+                       SettingsAPI.update(globalData);
+                   }
+               }
+            });
+
+            showToast(`Награда получена: +${state.tasks[taskIndex].reward} USDT!`);
+            triggerHaptic('success');
+            updateHeaderUI();
+          } else {
+            state.tasks[taskIndex].status = 'todo';
+            showToast(`Ошибка проверки. Убедитесь, что выполнили задание.`);
+            triggerHaptic('error');
+          }
+          saveState();
+          if (currentTab === 'tasks') renderTab('tasks');
+        }, 3000);
+      }
+    });
+  });
+}
+
+function renderFriends() {
+  const refFixed = state.settings.refBonusFixed !== undefined ? state.settings.refBonusFixed : 0.1;
+  const refPercent = state.settings.refBonusPercent !== undefined ? state.settings.refBonusPercent : 10;
+  
+  const itemsPerPage = 10;
+  const totalPages = Math.ceil(state.friends.length / itemsPerPage) || 1;
+  if (friendsPage > totalPages) friendsPage = totalPages;
+  const currentFriends = state.friends.slice((friendsPage - 1) * itemsPerPage, friendsPage * itemsPerPage);
+
+  let html = `
+    <div class="px-4 pt-4 pb-6 h-full overflow-y-auto hide-scrollbar">
+      
+      <!-- MEGA BEAUTIFUL HERO BANNER -->
+      <div class="relative rounded-[2rem] p-6 mb-5 overflow-hidden shadow-2xl border border-white/10 animate-slide-up group" style="background: radial-gradient(circle at top right, #3b0764, #0f172a);">
+        <!-- Animated abstract shapes -->
+        <div class="absolute -right-10 -top-10 w-48 h-48 bg-pink-500/20 rounded-full blur-3xl pointer-events-none group-hover:bg-pink-500/30 transition-colors duration-700"></div>
+        <div class="absolute -left-10 -bottom-10 w-40 h-40 bg-blue-500/20 rounded-full blur-3xl pointer-events-none group-hover:bg-blue-500/30 transition-colors duration-700"></div>
+        
+        <div class="relative z-10 flex flex-col items-center text-center">
+          <div class="w-20 h-20 mb-4 bg-gradient-to-tr from-pink-500 to-purple-600 rounded-full flex items-center justify-center shadow-[0_0_30px_rgba(219,39,119,0.4)] border-4 border-slate-900/50 float-anim relative">
+            <i class="fas fa-gift text-4xl text-white drop-shadow-lg"></i>
+            <div class="absolute -top-1 -right-1 w-6 h-6 bg-yellow-400 rounded-full border-2 border-slate-900 flex items-center justify-center animate-bounce shadow-sm">
+              <i class="fas fa-star text-[10px] text-yellow-900"></i>
+            </div>
+          </div>
+          <h2 class="text-2xl font-black text-transparent bg-clip-text bg-gradient-to-r from-white to-pink-200 tracking-tight mb-2">Зови друзей</h2>
+          <p class="text-pink-100/80 text-[11px] leading-relaxed max-w-[220px]">
+            Получай <span class="bg-white/10 text-white font-bold px-1.5 py-0.5 rounded shadow-sm">${refFixed} USDT</span> сразу и <span class="bg-white/10 text-white font-bold px-1.5 py-0.5 rounded shadow-sm">${refPercent}%</span> от их добычи пожизненно!
+          </p>
+        </div>
+      </div>
+      
+      <!-- HOW IT WORKS WIDGET -->
+      <div class="bg-slate-800/40 backdrop-blur-xl p-3 rounded-2xl mb-5 border border-slate-700/50 shadow-inner flex justify-between items-center animate-slide-up delay-75 relative overflow-hidden">
+        <div class="absolute inset-0 bg-gradient-to-r from-blue-500/5 via-purple-500/5 to-pink-500/5 pointer-events-none"></div>
+        <div class="flex flex-col items-center relative z-10 w-1/3">
+          <div class="w-10 h-10 rounded-full bg-blue-500/10 border border-blue-500/20 flex items-center justify-center mb-1.5 text-blue-400"><i class="fas fa-paper-plane text-sm"></i></div>
+          <p class="text-[9px] text-slate-400 font-bold uppercase tracking-wider">Отправь</p>
+        </div>
+        <i class="fas fa-chevron-right text-slate-600 text-xs relative z-10"></i>
+        <div class="flex flex-col items-center relative z-10 w-1/3">
+          <div class="w-10 h-10 rounded-full bg-purple-500/10 border border-purple-500/20 flex items-center justify-center mb-1.5 text-purple-400"><i class="fas fa-user-plus text-sm"></i></div>
+          <p class="text-[9px] text-slate-400 font-bold uppercase tracking-wider">Пригласи</p>
+        </div>
+        <i class="fas fa-chevron-right text-slate-600 text-xs relative z-10"></i>
+        <div class="flex flex-col items-center relative z-10 w-1/3">
+          <div class="w-10 h-10 rounded-full bg-teal-500/10 border border-teal-500/20 flex items-center justify-center mb-1.5 text-teal-400"><i class="fas fa-coins text-sm"></i></div>
+          <p class="text-[9px] text-slate-400 font-bold uppercase tracking-wider">Получи</p>
+        </div>
+      </div>
+      
+      <!-- STATS CARDS -->
+      <div class="grid grid-cols-2 gap-3 mb-5 animate-slide-up delay-150">
+        <div class="bg-slate-800/60 backdrop-blur-xl p-4 rounded-2xl border border-slate-700/50 relative overflow-hidden group hover:border-blue-500/40 transition-all">
+          <div class="absolute -right-6 -top-6 w-20 h-20 bg-blue-500/10 rounded-full blur-2xl group-hover:bg-blue-500/20 transition-colors"></div>
+          <p class="text-[9px] text-slate-400 mb-1 uppercase tracking-widest font-bold flex items-center"><i class="fas fa-users mr-1.5 text-blue-500/50"></i>Приглашено</p>
+          <div class="text-3xl font-black text-white drop-shadow-md">${state.friends.length}</div>
+        </div>
+        <div class="bg-slate-800/60 backdrop-blur-xl p-4 rounded-2xl border border-slate-700/50 relative overflow-hidden group hover:border-teal-500/40 transition-all">
+          <div class="absolute -right-6 -top-6 w-20 h-20 bg-teal-500/10 rounded-full blur-2xl group-hover:bg-teal-500/20 transition-colors"></div>
+          <p class="text-[9px] text-slate-400 mb-1 uppercase tracking-widest font-bold flex items-center"><i class="fas fa-wallet mr-1.5 text-teal-500/50"></i>Доход</p>
+          <div class="text-xl font-black text-teal-400 drop-shadow-md flex items-end h-[36px]">
+            +${state.friends.reduce((sum, f) => sum + f.earned, 0).toFixed(2)} <span class="text-[10px] text-teal-500 font-bold ml-1 mb-1">USDT</span>
+          </div>
+        </div>
+      </div>
+      
+      <!-- MEGA BUTTON -->
+      <div class="animate-slide-up delay-225 mb-5 relative">
+        <div class="absolute inset-0 bg-gradient-to-r from-pink-500 to-purple-500 rounded-2xl blur-lg opacity-40 animate-pulse pointer-events-none"></div>
+        <button id="copy-link-btn" class="w-full py-4 bg-gradient-to-r from-pink-500 to-purple-600 hover:from-pink-400 hover:to-purple-500 text-white rounded-2xl font-black text-sm transition-all tap-effect shadow-[0_0_20px_rgba(219,39,119,0.3)] flex items-center justify-center space-x-2 uppercase tracking-wide relative overflow-hidden group border border-pink-400/50">
+          <div class="absolute inset-0 bg-white/20 transform -skew-x-12 -translate-x-full group-hover:animate-[shimmer_1.5s_infinite]"></div>
+          <i class="fas fa-paper-plane text-lg relative z-10"></i>
+          <span class="relative z-10 drop-shadow-md">Отправить приглашение</span>
+        </button>
+      </div>
+
+      ${currentUser.username && currentUser.username.startsWith('web_') ? `
+      <div class="mb-5 p-3 bg-slate-850 border border-slate-700 rounded-xl shadow-inner animate-slide-up delay-225 flex justify-between items-center">
+        <p class="text-[9px] text-teal-400 font-bold uppercase tracking-wider m-0"><i class="fas fa-info-circle mr-1"></i> Тест. режим</p>
+        <button id="test-ref-btn" class="px-3 py-1.5 bg-slate-800 text-white border border-slate-600 rounded-lg font-bold text-[10px] hover:bg-slate-700 transition-colors tap-effect shadow-sm">
+          <i class="fas fa-user-plus mr-1 text-teal-400"></i>Добавить реферала
+        </button>
+      </div>` : ''}
+      
+      <!-- FRIENDS LIST -->
+      <div class="animate-slide-up delay-300">
+        <div class="flex justify-between items-end mb-3 px-1">
+          <h3 class="font-bold text-white text-sm">Ваши друзья</h3>
+          <button id="top-refs-btn" class="text-[10px] text-yellow-400 font-bold bg-yellow-500/10 px-3 py-1.5 rounded-lg border border-yellow-500/30 tap-effect flex items-center shadow-sm hover:bg-yellow-500/20 transition-colors uppercase tracking-wider">
+            <i class="fas fa-crown mr-1.5"></i> Топ лидеров
+          </button>
+        </div>
+        <div class="space-y-2.5 pb-20">
+  `;
+
+  if (state.friends.length === 0) {
+    html += `
+      <div class="text-center py-10 bg-slate-800/40 backdrop-blur-xl rounded-3xl border border-slate-700/50 shadow-inner relative overflow-hidden">
+        <div class="absolute inset-0 bg-gradient-to-b from-transparent to-slate-900/80 pointer-events-none"></div>
+        <div class="w-16 h-16 mx-auto bg-slate-900 rounded-full flex items-center justify-center mb-4 text-slate-600 border border-slate-800 shadow-inner relative z-10">
+          <i class="fas fa-user-clock text-2xl"></i>
+        </div>
+        <p class="text-white font-bold text-sm relative z-10">Список пуст</p>
+        <p class="text-slate-500 text-[10px] mt-1 px-8 relative z-10">Пока никто не присоединился. Отправьте ссылку друзьям!</p>
+      </div>
+    `;
+  } else {
+    currentFriends.forEach(friend => {
+      html += `
+        <div class="bg-slate-800/40 backdrop-blur-xl p-3.5 rounded-2xl border border-slate-700/50 flex items-center justify-between shadow-sm hover:border-slate-600 hover:bg-slate-800/80 transition-all tap-effect group">
+          <div class="flex items-center space-x-3.5 min-w-0">
+            <div class="w-11 h-11 rounded-full bg-gradient-to-br from-slate-700 to-slate-800 flex items-center justify-center text-sm font-black text-white shadow-inner border border-slate-600 shrink-0 relative overflow-hidden group-hover:scale-105 transition-transform">
+              ${friend.name.charAt(0)}
+              <div class="absolute inset-0 bg-gradient-to-tr from-transparent via-white/5 to-transparent"></div>
+            </div>
+            <div class="min-w-0">
+              <p class="font-bold text-xs text-white truncate max-w-[130px] tracking-wide">${friend.name}</p>
+              <p class="text-[9px] text-slate-500 mt-0.5 font-mono bg-slate-900/50 inline-block px-1.5 py-0.5 rounded"><i class="fas fa-calendar-alt mr-1 opacity-50"></i>${friend.date}</p>
+            </div>
+          </div>
+          <div class="text-right shrink-0 bg-slate-900/80 px-3 py-1.5 rounded-xl border border-slate-800 shadow-inner group-hover:border-teal-500/30 transition-colors">
+            <p class="text-teal-400 font-black text-xs drop-shadow-sm">+${friend.earned.toFixed(2)}</p>
+            <p class="text-[7px] text-slate-500 font-bold uppercase tracking-widest mt-0.5">USDT</p>
+          </div>
+        </div>
+      `;
+    });
+
+    if (totalPages > 1) {
+      html += `
+        <div class="flex items-center justify-between mt-5 px-1 animate-slide-up delay-400 relative z-10">
+          <button id="prev-friend-btn" class="px-4 py-2 bg-slate-800 rounded-xl text-[11px] font-bold text-slate-400 hover:text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed tap-effect shadow-sm border border-slate-700" ${friendsPage <= 1 ? 'disabled' : ''}>
+            <i class="fas fa-chevron-left mr-1"></i> Назад
+          </button>
+          <span class="text-[10px] text-slate-500 font-medium bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-800">Стр. ${friendsPage} из ${totalPages}</span>
+          <button id="next-friend-btn" class="px-4 py-2 bg-slate-800 rounded-xl text-[11px] font-bold text-slate-400 hover:text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed tap-effect shadow-sm border border-slate-700" ${friendsPage >= totalPages ? 'disabled' : ''}>
+            Вперед <i class="fas fa-chevron-right ml-1"></i>
+          </button>
+        </div>
+      `;
+    }
+  }
+  html += `</div></div></div>`;
+  return html;
+}
+
+function attachFriendsEvents() {
+  document.getElementById('copy-link-btn').addEventListener('click', () => {
+    triggerHaptic('medium');
+    const link = `${BOT_LINK}?start=${currentUser.id}`;
+    navigator.clipboard.writeText(link).then(() => {
+      showToast("Ссылка для приглашения скопирована!");
+    }).catch(err => {
+      const textArea = document.createElement("textarea");
+      textArea.value = link;
+      document.body.appendChild(textArea);
+      textArea.select();
+      document.execCommand("copy");
+      textArea.remove();
+      showToast("Ссылка для приглашения скопирована!");
+    });
+  });
+
+  const topRefsBtn = document.getElementById('top-refs-btn');
+  if (topRefsBtn) {
+    topRefsBtn.addEventListener('click', () => {
+      triggerHaptic('medium');
+      if (typeof window.openLeaderboardModal === 'function') {
+         window.openLeaderboardModal();
+      }
+    });
+  }
+
+  const testBtn = document.getElementById('test-ref-btn');
+  if(testBtn) {
+      testBtn.addEventListener('click', () => {
+        triggerHaptic('success');
+        const mockNames = ['Alex', 'Dmitry', 'Elena', 'Ivan', 'Maria'];
+        const randomName = mockNames[Math.floor(Math.random() * mockNames.length)];
+        const refFixed = state.settings.refBonusFixed !== undefined ? state.settings.refBonusFixed : 0.1;
+        
+        state.user.balance += refFixed;
+        state.user.totalEarned += refFixed;
+        
+        state.friends.push({
+          id: Math.floor(Math.random() * 10000),
+          name: randomName + Math.floor(Math.random() * 100),
+          date: new Date().toLocaleDateString(),
+          earned: refFixed
+        });
+        saveState();
+        renderTab('friends');
+        showToast(`Тест: ${randomName} стал рефералом (+${refFixed} USDT)`);
+      });
+  }
+
+  const prevFBtn = document.getElementById('prev-friend-btn');
+  if (prevFBtn) {
+    prevFBtn.addEventListener('click', () => {
+      triggerHaptic('light');
+      if (friendsPage > 1) {
+        friendsPage--;
+        renderTab('friends');
+      }
+    });
+  }
+
+  const nextFBtn = document.getElementById('next-friend-btn');
+  if (nextFBtn) {
+    nextFBtn.addEventListener('click', () => {
+      triggerHaptic('light');
+      friendsPage++;
+      renderTab('friends');
+    });
+  }
+}
+
+function renderProfile() {
+  const minWith = state.settings.minWithdrawal;
+  
+  const history = [
+    ...(state.withdrawals || []).map(w => ({...w, type: 'withdraw'})),
+    ...(state.deposits || []).map(d => ({...d, type: 'deposit'}))
+  ].sort((a,b) => new Date(a.date) - new Date(b.date)).reverse();
+
+  const itemsPerPage = 5;
+  const totalPages = Math.ceil(history.length / itemsPerPage) || 1;
+  if (profileHistoryPage > totalPages) profileHistoryPage = totalPages;
+  const currentHistory = history.slice((profileHistoryPage - 1) * itemsPerPage, profileHistoryPage * itemsPerPage);
+
+  const avatarHtml = currentUser.photo_url 
+    ? '<img src="' + currentUser.photo_url + '" class="w-full h-full object-cover" alt="Avatar">' 
+    : currentUser.first_name.charAt(0);
+
+  let html = `
+    <div class="px-4 pt-4 pb-6 h-full overflow-y-auto hide-scrollbar">
+      
+      <!-- ULTRA MEGA PREMIUM PROFILE HEADER -->
+      <div class="relative rounded-[2.5rem] p-6 mb-6 shadow-[0_20px_40px_rgba(0,0,0,0.5)] border border-white/5 animate-slide-up group overflow-hidden bg-[#0d1321]">
+        <!-- Animated Background Mesh/Gradient -->
+        <div class="absolute inset-0 bg-gradient-to-br from-teal-900/40 via-blue-900/20 to-[#0d1321] z-0"></div>
+        <div class="absolute top-0 right-0 w-64 h-64 bg-teal-500/10 rounded-full blur-[80px] group-hover:bg-teal-500/20 transition-all duration-1000 z-0"></div>
+        <div class="absolute bottom-0 left-0 w-48 h-48 bg-blue-500/10 rounded-full blur-[60px] group-hover:bg-blue-500/20 transition-all duration-1000 z-0"></div>
+
+        <div class="flex items-center space-x-5 mb-5 relative z-10">
+          <div class="relative w-24 h-24 rounded-full p-1 bg-gradient-to-tr from-teal-400 via-blue-500 to-purple-500 shadow-[0_0_30px_rgba(45,212,191,0.5)] shrink-0 float-anim group-hover:rotate-6 transition-transform duration-500">
+             <div class="w-full h-full rounded-full bg-slate-900 flex items-center justify-center text-4xl font-black text-white border-4 border-slate-900 overflow-hidden relative">
+               <div class="absolute inset-0 bg-gradient-to-t from-black/50 to-transparent z-10"></div>
+               <span class="relative z-0">${avatarHtml}</span>
+             </div>
+          </div>
+          <div class="min-w-0 flex-1">
+            <h2 class="text-3xl font-black text-transparent bg-clip-text bg-gradient-to-r from-white to-teal-100 truncate tracking-tight mb-2">${currentUser.first_name}</h2>
+            <div class="flex flex-wrap items-center gap-2">
+                <span class="bg-white/10 text-white px-2.5 py-1 rounded-lg text-[10px] font-bold border border-white/10 uppercase tracking-widest shadow-inner backdrop-blur-md">ID: ${currentUser.id}</span>
+                <button onclick="navigator.clipboard.writeText('${currentUser.id}'); showToast('ID скопирован!')" class="w-7 h-7 rounded-lg bg-teal-500/20 flex items-center justify-center text-teal-300 hover:text-white hover:bg-teal-500 transition-colors border border-teal-500/30 tap-effect shadow-inner"><i class="fas fa-copy text-[10px]"></i></button>
+            </div>
+          </div>
+        </div>
+
+        <div class="flex items-center justify-between pt-4 border-t border-white/10 relative z-10">
+          <div class="flex flex-col">
+             <span class="text-[9px] text-teal-200/60 uppercase tracking-widest font-bold mb-1">Всего добыто</span>
+             <span class="text-lg font-black text-white drop-shadow-md">+${state.user.totalEarned.toFixed(2)} <span class="text-[10px] text-teal-300">USDT</span></span>
+          </div>
+          <div class="flex flex-col text-right">
+             <span class="text-[9px] text-teal-200/60 uppercase tracking-widest font-bold mb-1">В игре с</span>
+             <span class="text-xs text-white font-medium bg-black/20 px-2.5 py-1 rounded-md border border-white/10 shadow-inner"><i class="fas fa-calendar-alt text-teal-500/50 mr-1.5"></i>${state.user.joinedDate}</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- GLASSMORPHISM PREMIUM WALLET CARD -->
+      <div class="animate-slide-up delay-75 glass-premium rounded-[2rem] p-6 mb-6 relative overflow-hidden group hover-glow transition-all duration-300">
+        <div class="absolute -right-10 -bottom-10 w-32 h-32 bg-blue-500/20 rounded-full blur-3xl group-hover:bg-blue-400/30 transition-colors duration-500"></div>
+        <div class="absolute -left-10 -top-10 w-32 h-32 bg-teal-500/10 rounded-full blur-3xl group-hover:bg-teal-400/20 transition-colors duration-500"></div>
+
+        <div class="flex items-center justify-between relative z-10 mb-6">
+          <div class="flex flex-col">
+            <span class="text-slate-400 text-[10px] font-bold uppercase tracking-widest flex items-center"><i class="fas fa-credit-card mr-2 text-blue-400/80 text-sm"></i> Мой баланс</span>
+            <div class="font-black text-white text-4xl md:text-5xl leading-none mt-2 drop-shadow-[0_2px_10px_rgba(0,0,0,0.5)] tracking-tighter">${state.user.balance.toFixed(2)}<span class="text-base text-blue-400 align-top font-bold ml-1">USDT</span></div>
+          </div>
+          <div class="w-12 h-12 rounded-2xl bg-gradient-to-br from-blue-500 to-teal-400 flex items-center justify-center text-xl text-white shadow-[0_0_20px_rgba(59,130,246,0.4)] border-2 border-slate-900/50 transform group-hover:rotate-12 transition-transform duration-300">
+            <i class="fas fa-wallet"></i>
+          </div>
+        </div>
+        
+        <div class="flex space-x-3 relative z-10 mb-4">
+          <button id="deposit-btn" class="flex-1 py-4 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white rounded-2xl shadow-[0_10px_25px_rgba(59,130,246,0.4)] flex items-center justify-center transition-all tap-effect font-black text-sm border border-blue-400/30 uppercase tracking-widest">
+            <i class="fas fa-arrow-down mr-2 text-blue-200"></i> Ввод
+          </button>
+          <button id="withdraw-btn" class="flex-1 py-4 bg-slate-800/80 hover:bg-slate-700 text-white border border-slate-600/50 rounded-2xl flex items-center justify-center transition-all tap-effect font-black text-sm shadow-inner group-hover:border-slate-500 uppercase tracking-widest">
+            Вывод <i class="fas fa-arrow-up ml-2 text-slate-400 group-hover:text-white transition-colors"></i>
+          </button>
+        </div>
+        
+        <div class="grid grid-cols-2 gap-3 relative z-10">
+          <button onclick="window.openStakingModal()" class="py-3.5 bg-slate-900/60 hover:bg-slate-800 text-teal-400 rounded-xl border border-teal-500/20 flex items-center justify-center transition-all tap-effect font-bold text-xs shadow-inner uppercase tracking-wide group/btn">
+            <i class="fas fa-vault mr-2 group-hover/btn:scale-110 transition-transform text-lg text-teal-500/70"></i> Сейф
+          </button>
+          <button onclick="window.openFAQModal()" class="py-3.5 bg-slate-900/60 hover:bg-slate-800 text-blue-400 rounded-xl border border-blue-500/20 flex items-center justify-center transition-all tap-effect font-bold text-xs shadow-inner uppercase tracking-wide group/btn">
+            <i class="fas fa-question-circle mr-2 group-hover/btn:scale-110 transition-transform text-lg text-blue-500/70"></i> FAQ
+          </button>
+        </div>
+      </div>
+
+      <!-- PREMIUM PROMO SECTION -->
+      <div class="animate-slide-up delay-150 glass-premium rounded-2xl p-2 border border-slate-700/50 mb-8 flex items-center space-x-2 relative overflow-hidden focus-within:border-teal-500/50 focus-within:shadow-[0_0_20px_rgba(45,212,191,0.15)] transition-all group">
+        <div class="absolute inset-0 bg-gradient-to-r from-teal-500/5 to-transparent pointer-events-none"></div>
+        <div class="w-10 h-10 rounded-xl bg-slate-900 border border-slate-700 flex items-center justify-center text-teal-400 shrink-0 shadow-inner relative z-10 group-focus-within:bg-teal-500/10 group-focus-within:text-teal-300 transition-colors group-focus-within:-rotate-12 duration-300">
+          <i class="fas fa-gift text-sm drop-shadow-sm"></i>
+        </div>
+        <input type="text" id="promo-input" class="flex-1 bg-transparent border-none text-white text-xs focus:ring-0 outline-none placeholder-slate-500 uppercase font-mono py-2 relative z-10" placeholder="ВВЕДИТЕ ПРОМОКОД...">
+        <button id="activate-promo-btn" class="py-2.5 px-4 bg-gradient-to-r from-teal-500 to-emerald-500 hover:from-teal-400 hover:to-emerald-400 text-slate-900 rounded-xl font-black text-[10px] tap-effect shadow-[0_5px_15px_rgba(20,184,166,0.3)] transition-colors shrink-0 relative z-10 tracking-widest uppercase border border-teal-400/50">Применить</button>
+      </div>
+
+      <!-- HISTORY SECTION -->
+      <div class="animate-slide-up delay-200">
+        <div class="flex justify-between items-end mb-5 px-1">
+          <h3 class="font-bold text-white text-sm tracking-wide flex items-center"><i class="fas fa-history mr-2 text-slate-400"></i> История операций</h3>
+          <span class="text-[9px] bg-slate-800/80 text-slate-400 px-2.5 py-1.5 rounded-lg border border-slate-700 font-bold uppercase tracking-widest shadow-inner">${history.length} записей</span>
+        </div>
+        <div class="space-y-3 pb-20">
+  `;
+
+  if (history.length === 0) {
+    html += `
+      <div class="text-center py-12 glass-premium rounded-3xl border border-slate-700/50 relative overflow-hidden group">
+        <div class="absolute inset-0 bg-gradient-to-b from-transparent to-slate-900/80 pointer-events-none"></div>
+        <div class="w-20 h-20 mx-auto bg-slate-900/80 rounded-full flex items-center justify-center mb-4 text-slate-600 shadow-inner border border-slate-800 relative z-10 group-hover:scale-110 transition-transform duration-500">
+          <i class="fas fa-receipt text-3xl"></i>
+        </div>
+        <h3 class="text-white font-bold text-base mb-1 relative z-10">История пуста</h3>
+        <p class="text-slate-500 text-[11px] px-8 relative z-10">Здесь будут отображаться ваши пополнения и выводы.</p>
+      </div>
+    `;
+  } else {
+    const renderItem = (t, index) => {
+      let isDep = t.type === 'deposit';
+      let statusColor = t.status === 'pending' ? 'text-yellow-400' : (t.status === 'completed' ? (isDep ? 'text-blue-400' : 'text-teal-400') : 'text-red-400');
+      let statusBg = t.status === 'pending' ? 'bg-yellow-500/10 border-yellow-500/20' : (t.status === 'completed' ? (isDep ? 'bg-blue-500/10 border-blue-500/20' : 'bg-teal-500/10 border-teal-500/20') : 'bg-red-500/10 border-red-500/20');
+      let statusIcon = t.status === 'pending' ? 'fa-clock' : (t.status === 'completed' ? 'fa-check-circle' : 'fa-times-circle');
+      let displayStatus = t.status === 'pending' ? 'В обработке' : (t.status === 'completed' ? 'Выполнено' : 'Отклонено');
+      
+      let amountClass = isDep ? 'text-blue-400' : 'text-white';
+      let amountPrefix = isDep ? '+' : '-';
+      let typeIcon = isDep ? 'fa-arrow-down' : 'fa-arrow-up';
+      let typeIconColor = isDep ? 'text-blue-400' : 'text-slate-300';
+      let typeBg = isDep ? 'bg-blue-500/10 border-blue-500/20' : 'bg-slate-700/50 border-slate-600';
+      let infoText = isDep ? 'Пополнение • ' + t.method : 'Вывод • ' + t.network;
+      let addressHtml = !isDep ? '<span class="text-[10px] text-slate-500 mt-2 block font-mono bg-slate-900/80 px-2.5 py-1 rounded-md border border-slate-800 w-max" title="' + t.address + '">' + t.address.substring(0,8) + '...' + t.address.slice(-6) + '</span>' : '';
+
+      return `
+        <div class="glass-premium p-4 rounded-2xl flex items-center justify-between hover:border-slate-500 transition-all tap-effect group relative overflow-hidden animate-slide-up" style="animation-delay: ${index * 75 + 150}ms">
+          <div class="absolute inset-0 bg-gradient-to-r from-white/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none"></div>
+          <div class="flex items-start space-x-4 relative z-10 min-w-0">
+            <div class="w-12 h-12 rounded-xl ${typeBg} flex items-center justify-center ${typeIconColor} shrink-0 text-base border shadow-inner group-hover:scale-110 transition-transform duration-300">
+               <i class="fas ${typeIcon}"></i>
+            </div>
+            <div class="min-w-0 pr-2">
+              <p class="font-black text-[15px] ${amountClass} tracking-tight drop-shadow-sm mb-0.5">${amountPrefix}${t.amount.toFixed(2)} <span class="text-[9px] font-bold opacity-80 uppercase align-middle">USDT</span></p>
+              <p class="text-[10px] text-slate-400 font-medium tracking-wide truncate"><i class="fas fa-calendar-alt text-slate-500/50 mr-1.5"></i>${new Date(t.date).toLocaleString([], {day: '2-digit', month: '2-digit', hour: '2-digit', minute:'2-digit'})} <span class="mx-1.5 opacity-30">•</span> ${infoText}</p>
+              ${addressHtml}
+            </div>
+          </div>
+          <div class="flex flex-col items-end relative z-10 shrink-0">
+            <span class="${statusColor} ${statusBg} border text-[9px] font-bold flex items-center px-2.5 py-1.5 rounded-xl shadow-inner group-hover:scale-105 transition-transform">
+              <i class="fas ${statusIcon} mr-1.5"></i>
+              <span class="uppercase tracking-widest">${displayStatus}</span>
+            </span>
+          </div>
+        </div>
+      `;
+    };
+
+    currentHistory.forEach((t, i) => {
+      html += renderItem(t, i);
+    });
+
+    if (totalPages > 1) {
+      html += `
+        <div class="flex items-center justify-between mt-6 px-1 animate-slide-up" style="animation-delay: 400ms">
+          <button id="prev-page-btn" class="px-5 py-2.5 bg-slate-800 rounded-xl text-[11px] font-bold text-slate-400 hover:text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed tap-effect shadow-sm border border-slate-700" ${profileHistoryPage <= 1 ? 'disabled' : ''}>
+            <i class="fas fa-chevron-left mr-2"></i> Назад
+          </button>
+          <span class="text-[11px] text-slate-400 font-bold bg-slate-900/80 px-4 py-2 rounded-xl border border-slate-800 shadow-inner">Стр. ${profileHistoryPage} из ${totalPages}</span>
+          <button id="next-page-btn" class="px-5 py-2.5 bg-slate-800 rounded-xl text-[11px] font-bold text-slate-400 hover:text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed tap-effect shadow-sm border border-slate-700" ${profileHistoryPage >= totalPages ? 'disabled' : ''}>
+            Вперед <i class="fas fa-chevron-right ml-2"></i>
+          </button>
+        </div>
+      `;
+    }
+  }
+  html += '</div></div></div>';
+  return html;
+}
+
+function attachProfileEvents() {
+  const withdrawBtn = document.getElementById('withdraw-btn');
+  if (withdrawBtn) {
+    withdrawBtn.addEventListener('click', () => {
+      triggerHaptic('medium');
+      openWithdrawModal();
+    });
+  }
+
+  const depositBtn = document.getElementById('deposit-btn');
+  if (depositBtn) {
+    depositBtn.addEventListener('click', () => {
+      triggerHaptic('medium');
+      openDepositModal();
+    });
+  }
+
+  const promoBtn = document.getElementById('activate-promo-btn');
+  if (promoBtn) {
+    promoBtn.addEventListener('click', () => {
+      triggerHaptic('medium');
+      const code = document.getElementById('promo-input').value.trim().toUpperCase();
+      if (!code) return showToast("Введите промокод");
+
+      if (!state.user.usedPromos) state.user.usedPromos = [];
+      if (!state.admin.promoCodes) state.admin.promoCodes = [];
+
+      if (state.user.usedPromos.includes(code)) {
+        return showToast("Вы уже использовали этот промокод");
+      }
+
+      const promo = state.admin.promoCodes.find(p => p.code === code);
+      if (!promo) {
+        return showToast("Промокод не найден");
+      }
+      if (!promo.active) {
+        return showToast("Промокод неактивен");
+      }
+      if (promo.maxUses > 0 && promo.currentUses >= promo.maxUses) {
+        return showToast("Лимит активаций исчерпан");
+      }
+
+      promo.currentUses += 1;
+      state.user.usedPromos.push(code);
+      state.user.balance += promo.reward;
+      state.user.totalEarned += promo.reward;
+
+      SettingsAPI.get().then(globalData => {
+          if (globalData && globalData.promoCodes) {
+              const globalPromo = globalData.promoCodes.find(p => p.code === code);
+              if (globalPromo) {
+                  globalPromo.currentUses = (globalPromo.currentUses || 0) + 1;
+                  SettingsAPI.update(globalData);
+              }
+          }
+      });
+
+      if (!state.deposits) state.deposits = [];
+      state.deposits.push({
+        id: 'p' + Date.now(),
+        amount: promo.reward,
+        method: 'Промокод: ' + code,
+        status: 'completed',
+        date: new Date().toISOString()
+      });
+
+      saveState();
+      updateHeaderUI();
+      renderTab('profile');
+      showToast(`Промокод активирован: +${promo.reward} USDT!`);
+      triggerHaptic('success');
+    });
+  }
+
+  const prevBtn = document.getElementById('prev-page-btn');
+  if (prevBtn) {
+    prevBtn.addEventListener('click', () => {
+      triggerHaptic('light');
+      if (profileHistoryPage > 1) {
+        profileHistoryPage--;
+        renderTab('profile');
+      }
+    });
+  }
+
+  const nextBtn = document.getElementById('next-page-btn');
+  if (nextBtn) {
+    nextBtn.addEventListener('click', () => {
+      triggerHaptic('light');
+      profileHistoryPage++;
+      renderTab('profile');
+    });
+  }
+}
+
+// ==========================================
+// DEPOSIT FLOW (TONKEEPER ONLY)
+// ==========================================
+
+function openDepositModal() {
+  modalContent.innerHTML = `
+    <h3 class="text-xl font-bold text-white mb-4">Пополнение баланса</h3>
+    <div class="mb-6">
+      <label class="block text-xs text-slate-400 mb-2">Сумма (USDT)</label>
+      <input type="number" id="deposit-amount" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-3 text-white text-sm focus:outline-none focus:border-blue-500 transition-colors placeholder-slate-600" placeholder="Например: 10" min="1">
+      <p class="text-[10px] text-slate-500 mt-2"><i class="fas fa-info-circle mr-1"></i> Оплата производится прямым переводом в TON.</p>
+    </div>
+    <div class="flex space-x-3">
+      <button onclick="window.closeModal()" class="flex-1 py-3 bg-slate-800 text-white rounded-xl font-bold text-sm tap-effect">Отмена</button>
+      <button id="continue-deposit" class="flex-1 py-3 bg-blue-500 text-white rounded-xl font-bold text-sm shadow-lg shadow-blue-500/20 tap-effect">Далее</button>
+    </div>
+  `;
+
+  modalOverlay.classList.remove('hidden');
+  setTimeout(() => {
+    modalOverlay.classList.remove('opacity-0');
+    modalContent.classList.remove('scale-95');
+    modalContent.classList.add('animate-pop-in');
+  }, 10);
+
+  let selectedNetwork = 'TON';
+  setTimeout(() => {
+    const networkBtns = document.querySelectorAll('.dep-network-btn');
+    networkBtns.forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        networkBtns.forEach(b => {
+          b.classList.remove('bg-teal-500/20', 'border-teal-500', 'text-teal-400');
+          b.classList.add('bg-slate-800', 'border-slate-700', 'text-slate-400');
+        });
+        e.target.classList.remove('bg-slate-800', 'border-slate-700', 'text-slate-400');
+        e.target.classList.add('bg-teal-500/20', 'border-teal-500', 'text-teal-400');
+        selectedNetwork = e.target.dataset.net;
+      });
+    });
+  }, 50);
+
+  document.getElementById('continue-deposit').addEventListener('click', () => {
+    const amount = parseFloat(document.getElementById('deposit-amount').value);
+    if (isNaN(amount) || amount <= 0) {
+      showToast("Введите корректную сумму пополнения");
+      return;
+    }
+    openDepositStep2(amount, selectedNetwork);
+  });
+}
+
+async function openDepositStep2(amount) {
+  modalContent.innerHTML = `
+    <div class="flex flex-col items-center justify-center py-12 animate-pop-in">
+      <i class="fas fa-circle-notch fa-spin text-teal-400 text-4xl mb-4"></i>
+      <p class="text-slate-400 text-sm">Получаем актуальный курс TON...</p>
+    </div>
+  `;
+  
+  let tonPrice = 5.0; 
+  try {
+      const res = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=TONUSDT');
+      if (res.ok) {
+          const data = await res.json();
+          if (data && data.price) {
+              tonPrice = parseFloat(data.price);
+          }
+      }
+  } catch (e) {
+      console.warn("Не удалось получить курс TON", e);
+  }
+
+  const tonWallet = state.settings.tonWallet || 'EQ...';
+  const tonAmount = (amount / tonPrice).toFixed(4);
+  const nanoTon = Math.floor(parseFloat(tonAmount) * 1e9);
+  
+  modalContent.innerHTML = `
+    <h3 class="text-xl font-bold text-white mb-4">Автоматическая оплата</h3>
+    <div class="bg-slate-800 p-2 rounded-lg text-center mb-3 border border-slate-700 shadow-sm animate-slide-up">
+        <span class="text-[11px] text-slate-300">Актуальный курс: <span class="text-white font-bold">1 TON ≈ ${tonPrice.toFixed(2)} USDT</span></span>
+    </div>
+    <div class="bg-blue-500/10 border border-blue-500/20 p-4 rounded-xl text-center mb-5 animate-slide-up delay-75">
+        <p class="text-xs text-blue-400 mb-1 font-bold uppercase tracking-widest">К оплате</p>
+        <p class="text-3xl text-white font-black drop-shadow-md tracking-tight">${tonAmount} <span class="text-lg text-blue-400">TON</span></p>
+    </div>
+    
+    <button id="pay-with-ton-connect" class="w-full py-4 bg-gradient-to-r from-blue-500 to-indigo-500 hover:from-blue-400 hover:to-indigo-400 text-white rounded-xl font-black text-sm mb-3 tap-effect shadow-[0_5px_20px_rgba(59,130,246,0.3)] animate-slide-up delay-150 uppercase tracking-widest">
+        <i class="fas fa-wallet mr-2 text-lg"></i> Подключить кошелек
+    </button>
+    <button onclick="window.closeModal()" class="w-full py-3.5 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 rounded-xl font-bold text-xs tap-effect transition-colors animate-slide-up delay-200">Отмена</button>
+  `;
+  
+  modalOverlay.classList.remove('hidden');
+  setTimeout(() => { modalOverlay.classList.remove('opacity-0'); modalContent.classList.remove('scale-95'); }, 10);
+  
+  const payBtn = document.getElementById('pay-with-ton-connect');
+  
+  const updateBtnState = () => {
+      if (tonConnectUI && tonConnectUI.connected) {
+          payBtn.innerHTML = '<i class="fas fa-paper-plane mr-2 text-lg"></i> Подтвердить транзакцию';
+          payBtn.className = "w-full py-4 bg-gradient-to-r from-teal-500 to-emerald-500 hover:from-teal-400 hover:to-emerald-400 text-slate-900 rounded-xl font-black text-sm mb-3 tap-effect shadow-[0_5px_20px_rgba(20,184,166,0.4)] animate-slide-up uppercase tracking-widest border border-teal-400/50";
+      } else {
+          payBtn.innerHTML = '<i class="fas fa-wallet mr-2 text-lg"></i> Подключить кошелек';
+          payBtn.className = "w-full py-4 bg-gradient-to-r from-blue-500 to-indigo-500 hover:from-blue-400 hover:to-indigo-400 text-white rounded-xl font-black text-sm mb-3 tap-effect shadow-[0_5px_20px_rgba(59,130,246,0.3)] animate-slide-up uppercase tracking-widest";
+      }
+  };
+
+  if (tonConnectUI) {
+      updateBtnState();
+      const unsubscribe = tonConnectUI.onStatusChange(updateBtnState);
+      
+      const origClose = window.closeModal;
+      window.closeModal = () => {
+          unsubscribe();
+          window.closeModal = origClose;
+          origClose();
+      };
+      
+      payBtn.addEventListener('click', async () => {
+          if (!tonConnectUI.connected) {
+              await tonConnectUI.openModal();
+              return;
+          }
+          
+          try {
+              const transaction = {
+                  validUntil: Math.floor(Date.now() / 1000) + 60 * 5, 
+                  messages: [
+                      {
+                          address: tonWallet,
+                          amount: nanoTon.toString()
+                      }
+                  ]
+              };
+              
+              payBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>Ожидание...';
+              payBtn.disabled = true;
+              
+              const result = await tonConnectUI.sendTransaction(transaction);
+              
+              const dId = 'd' + Date.now();
+              const dateStr = new Date().toISOString();
+              
+              if(!state.deposits) state.deposits = [];
+              state.deposits.push({ id: dId, amount: amount, method: 'TonConnect (Авто)', status: 'completed', date: dateStr });
+              
+              state.user.balance += amount;
+              
+              saveState();
+              window.closeModal();
+              renderTab('profile');
+              showToast(`Успешно пополнено на ${amount} USDT!`);
+              triggerHaptic('success');
+              updateHeaderUI();
+          } catch (e) {
+              console.error(e);
+              updateBtnState();
+              payBtn.disabled = false;
+              showToast("Транзакция отменена или произошла ошибка");
+              triggerHaptic('error');
+          }
+      });
+  } else {
+      payBtn.innerHTML = '<i class="fas fa-exclamation-triangle mr-2"></i> TonConnect недоступен';
+      payBtn.disabled = true;
+  }
+}
+
+function openWithdrawModal() {
+  const minWith = state.settings.minWithdrawal;
+  if (state.user.balance < minWith) {
+     showToast(`Минимальная сумма вывода ${minWith} USDT`);
+     return;
+  }
+
+  modalContent.innerHTML = `
+    <h3 class="text-xl font-bold text-white mb-4">Вывод USDT</h3>
+    <div class="mb-4">
+      <label class="block text-xs text-slate-400 mb-2">Сеть</label>
+      <div class="grid grid-cols-2 gap-2">\n        <button class="network-btn active bg-teal-500/20 border border-teal-500 text-teal-400 py-2 rounded-lg text-sm font-bold transition-colors" data-net="TON">TON</button>\n        <button class="network-btn bg-slate-800 border border-slate-700 text-slate-400 py-2 rounded-lg text-sm font-bold transition-colors" data-net="BEP-20">BEP-20</button>\n      </div>
+    </div>
+    <div class="mb-4">
+      <label class="block text-xs text-slate-400 mb-2">Адрес кошелька</label>
+      <input type="text" id="wallet-address" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-3 text-white text-sm focus:outline-none focus:border-teal-500 transition-colors placeholder-slate-600" placeholder="Введите адрес USDT...">
+    </div>
+    <div class="mb-6">
+      <label class="block text-xs text-slate-400 mb-2">Сумма (Макс: ${state.user.balance.toFixed(2)})</label>
+      <div class="relative">
+        <input type="number" id="withdraw-amount" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-3 pr-16 text-white text-sm focus:outline-none focus:border-teal-500 transition-colors" value="${state.user.balance.toFixed(2)}" max="${state.user.balance}">
+        <button id="max-btn" class="absolute right-2 top-2 bottom-2 bg-slate-800 text-teal-400 text-xs font-bold px-3 rounded-md hover:bg-slate-700 transition-colors">МАКС</button>
+      </div>
+    </div>
+    <div class="flex space-x-3">
+      <button onclick="window.closeModal()" class="flex-1 py-3 bg-slate-800 text-white rounded-xl font-bold text-sm tap-effect">Отмена</button>
+      <button id="confirm-withdraw" class="flex-1 py-3 bg-teal-500 text-slate-900 rounded-xl font-bold text-sm shadow-lg shadow-teal-500/20 tap-effect">Подтвердить</button>
+    </div>
+  `;
+
+  modalOverlay.classList.remove('hidden');
+  setTimeout(() => {
+    modalOverlay.classList.remove('opacity-0');
+    modalContent.classList.remove('scale-95');
+    modalContent.classList.add('animate-pop-in');
+  }, 10);
+
+  let selectedNetwork = 'TON';
+  const networkBtns = document.querySelectorAll('.network-btn');
+  networkBtns.forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      networkBtns.forEach(b => {
+        b.classList.remove('bg-teal-500/20', 'border-teal-500', 'text-teal-400');
+        b.classList.add('bg-slate-800', 'border-slate-700', 'text-slate-400');
+      });
+      e.target.classList.remove('bg-slate-800', 'border-slate-700', 'text-slate-400');
+      e.target.classList.add('bg-teal-500/20', 'border-teal-500', 'text-teal-400');
+      selectedNetwork = e.target.dataset.net;
+    });
+  });
+
+  document.getElementById('max-btn').addEventListener('click', () => {
+    document.getElementById('withdraw-amount').value = state.user.balance.toFixed(2);
+  });
+
+  document.getElementById('confirm-withdraw').addEventListener('click', () => {
+    const address = document.getElementById('wallet-address').value.trim();
+    const amount = parseFloat(document.getElementById('withdraw-amount').value);
+
+    if (!address) { showToast("Пожалуйста, введите адрес кошелька"); return; }
+    if (isNaN(amount) || amount < minWith) { showToast(`Минимальная сумма вывода ${minWith} USDT`); return; }
+    if (amount > state.user.balance) { showToast("Недостаточно средств"); return; }
+
+    state.user.balance -= amount;
+    const wId = 'w' + Date.now();
+    const dateStr = new Date().toISOString();
+    
+    state.withdrawals.push({ id: wId, amount: amount, address: address, network: selectedNetwork, status: 'pending', date: dateStr });
+    state.admin.pendingWithdrawals.push({
+      id: wId,
+      userId: currentUser.id,
+      user: currentUser.username || currentUser.first_name,
+      amount: amount,
+      address: address,
+      network: selectedNetwork,
+      date: dateStr
+    });
+
+    saveState();
+    updateHeaderUI();
+    window.closeModal();
+    renderTab('profile');
+    showToast("Заявка на вывод успешно отправлена");
+    triggerHaptic('success');
+  });
+}
+
+// ==========================================
+// FULLSCREEN ADMIN PANEL LOGIC
+// ==========================================
+async function syncAdminData() {
+    if (!isAdmin) return;
+    const allDocs = await User.find({});
+    
+    let totalBalance = 0;
+    let totalPaid = 0;
+    let dailyActive = 0;
+    const now = Date.now();
+
+    const usersList = [];
+    let aggregatedPendingW = [];
+    let aggregatedPendingD = [];
+    
+    allDocs.forEach(doc => {
+        if (Number(doc.id) === 0) return;
+        const dState = doc.data || {};
+        const uData = dState.user || {};
+        totalBalance += (uData.balance || 0);
+        if (now - (uData.lastSync || 0) < 24 * 60 * 60 * 1000) {
+            dailyActive++;
+        }
+        
+        const userW = dState.withdrawals || [];
+        userW.forEach(w => {
+            if(w.status === 'completed') totalPaid += w.amount;
+            if(w.status === 'pending') {
+                aggregatedPendingW.push({
+                    id: w.id, userId: doc.id,
+                    user: (uData.username || uData.firstName || 'User ' + doc.id),
+                    amount: w.amount, address: w.address, network: w.network, date: w.date
+                });
+            }
+        });
+
+        const userD = dState.deposits || [];
+        userD.forEach(d => {
+            if (d.status === 'pending') {
+                aggregatedPendingD.push({
+                    id: d.id, userId: doc.id,
+                    user: (uData.username || uData.firstName || 'User ' + doc.id),
+                    amount: d.amount, method: d.method, memo: d.memo, date: d.date
+                });
+            }
+        });
+        
+        if (String(doc.id) !== String(currentUser.id)) {
+            usersList.push({
+                id: doc.id,
+                name: uData.firstName || 'User ' + doc.id,
+                username: uData.username || 'unknown',
+                balance: uData.balance || 0,
+                status: uData.status || 'active',
+                joined: uData.joinedDate || '-'
+            });
+        }
+    });
+
+    state.admin.stats.totalUsers = Math.max(0, allDocs.length - 1);
+    state.admin.stats.totalBalance = totalBalance;
+    state.admin.stats.dailyActive = dailyActive;
+    state.admin.stats.totalPaid = totalPaid;
+    
+    state.admin.users = usersList;
+    state.admin.pendingWithdrawals = aggregatedPendingW;
+    state.admin.pendingDeposits = aggregatedPendingD;
+}
+
+async function openAdminPanel() {
+  appContainer.classList.add('hidden');
+  adminAppContainer.classList.remove('hidden');
+  adminAppContainer.classList.add('flex');
+  
+  await syncAdminData();
+  renderAdminTab(currentAdminTab);
+}
+
+function closeAdminPanel() {
+  adminAppContainer.classList.add('hidden');
+  adminAppContainer.classList.remove('flex');
+  appContainer.classList.remove('hidden');
+  
+  document.querySelectorAll('#app .nav-btn').forEach(b => {
+      b.classList.remove('text-teal-400', 'active');
+      b.classList.add('text-slate-400');
+  });
+  const activeUserTabBtn = document.querySelector(`#app .nav-btn[data-tab="${currentTab}"]`);
+  if(activeUserTabBtn) {
+      activeUserTabBtn.classList.remove('text-slate-400');
+      activeUserTabBtn.classList.add('text-teal-400', 'active');
+  }
+}
+
+function setupAdminNavigation() {
+  document.querySelectorAll('.close-admin-btn').forEach(btn => {
+    btn.addEventListener('click', () => { triggerHaptic('light'); closeAdminPanel(); });
+  });
+
+  const adminTabBtns = document.querySelectorAll('.admin-tab-btn');
+  adminTabBtns.forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      triggerHaptic('light');
+      const target = e.currentTarget;
+      if(target) target.classList.add('animating');
+      setTimeout(() => { if(target) target.classList.remove('animating'); }, 400);
+      const tab = target ? target.dataset.atab : e.target.dataset.atab;
+      
+      adminTabBtns.forEach(b => {
+        b.classList.remove('bg-teal-500/10', 'text-teal-400', 'active');
+        b.classList.add('text-slate-400');
+        if(b.closest('aside')) b.classList.add('hover:bg-slate-800', 'hover:text-slate-200');
+      });
+      
+      document.querySelectorAll(`.admin-tab-btn[data-atab="${tab}"]`).forEach(b => {
+          b.classList.remove('text-slate-400', 'hover:bg-slate-800', 'hover:text-slate-200');
+          b.classList.add('bg-teal-500/10', 'text-teal-400', 'active');
+      });
+
+      currentAdminTab = tab;
+      renderAdminTab(tab);
+    });
+  });
+}
+
+function renderAdminTab(tab) {
+  adminContentArea.innerHTML = '';
+  const container = document.createElement('div');
+  container.className = 'fade-in h-full';
+
+  switch (tab) {
+    case 'dashboard': container.innerHTML = renderAdminDashboard(); break;
+    case 'users': container.innerHTML = renderAdminUsers(); break;
+    case 'tasks': container.innerHTML = renderAdminTasks(); break;
+    case 'finances': container.innerHTML = renderAdminFinances(); break;
+    case 'settings': container.innerHTML = renderAdminSettings(); break;
+    case 'broadcast': container.innerHTML = renderAdminBroadcast(); break;
+  }
+  adminContentArea.appendChild(container);
+}
+
+function renderAdminDashboard() {
+  const totalSystemBalance = state.admin.stats.totalBalance;
+  return `
+    <div class="mb-8 animate-slide-up relative z-10 flex items-center justify-between">
+      <div>
+        <h1 class="text-3xl font-black text-transparent bg-clip-text bg-gradient-to-r from-teal-400 via-blue-400 to-purple-500 tracking-tight mb-1">Дашборд</h1>
+        <p class="text-slate-400 text-[10px] font-bold uppercase tracking-widest flex items-center"><i class="fas fa-shield-alt mr-2 text-teal-500/70"></i>Главная статистика проекта</p>
+      </div>
+      <div class="w-12 h-12 rounded-full glass-premium flex items-center justify-center shadow-inner relative overflow-hidden group border border-slate-700">
+         <div class="absolute inset-0 bg-gradient-to-tr from-teal-500/20 to-blue-500/20 group-hover:scale-150 transition-transform duration-500"></div>
+         <i class="fas fa-satellite-dish text-teal-400 animate-pulse relative z-10"></i>
+      </div>
+    </div>
+
+    <!-- PREMIUM STATS GRID -->
+    <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8 relative z-10">
+      <div class="glass-premium p-5 rounded-3xl relative overflow-hidden group hover-glow animate-slide-up delay-50">
+        <div class="absolute -right-8 -top-8 w-32 h-32 bg-blue-500/10 rounded-full blur-3xl group-hover:bg-blue-500/20 transition-colors duration-500"></div>
+        <div class="w-12 h-12 rounded-2xl bg-gradient-to-br from-blue-500/20 to-blue-600/10 flex items-center justify-center text-blue-400 mb-4 border border-blue-500/20 shadow-inner group-hover:scale-110 group-hover:-rotate-6 transition-all duration-300"><i class="fas fa-users text-xl"></i></div>
+        <p class="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-1.5">Всего юзеров</p>
+        <p class="text-3xl font-black text-white drop-shadow-md tracking-tight">${state.admin.stats.totalUsers.toLocaleString()}</p>
+      </div>
+      <div class="glass-premium p-5 rounded-3xl relative overflow-hidden group hover:border-green-500/40 hover:box-shadow-[0_0_20px_rgba(34,197,94,0.2)] animate-slide-up delay-100">
+        <div class="absolute -right-8 -top-8 w-32 h-32 bg-green-500/10 rounded-full blur-3xl group-hover:bg-green-500/20 transition-colors duration-500"></div>
+        <div class="w-12 h-12 rounded-2xl bg-gradient-to-br from-green-500/20 to-green-600/10 flex items-center justify-center text-green-400 mb-4 border border-green-500/20 shadow-inner group-hover:scale-110 group-hover:rotate-6 transition-all duration-300"><i class="fas fa-bolt text-xl"></i></div>
+        <p class="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-1.5">Активных (24ч)</p>
+        <p class="text-3xl font-black text-white drop-shadow-md tracking-tight">${state.admin.stats.dailyActive.toLocaleString()}</p>
+      </div>
+      <div class="glass-premium p-5 rounded-3xl relative overflow-hidden group hover:border-teal-500/40 hover:box-shadow-[0_0_20px_rgba(45,212,191,0.2)] animate-slide-up delay-150">
+        <div class="absolute -right-8 -top-8 w-32 h-32 bg-teal-500/10 rounded-full blur-3xl group-hover:bg-teal-500/20 transition-colors duration-500"></div>
+        <div class="w-12 h-12 rounded-2xl bg-gradient-to-br from-teal-500/20 to-teal-600/10 flex items-center justify-center text-teal-400 mb-4 border border-teal-500/20 shadow-inner group-hover:scale-110 group-hover:-rotate-6 transition-all duration-300"><i class="fas fa-wallet text-xl"></i></div>
+        <p class="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-1.5">Балансы юзеров</p>
+        <p class="text-3xl font-black text-white drop-shadow-md tracking-tight">${totalSystemBalance.toLocaleString(undefined, {maximumFractionDigits:2})} <span class="text-xs text-teal-400 font-bold align-top ml-0.5">USDT</span></p>
+      </div>
+      <div class="glass-premium p-5 rounded-3xl relative overflow-hidden group hover:border-pink-500/40 hover:box-shadow-[0_0_20px_rgba(236,72,153,0.2)] animate-slide-up delay-200">
+        <div class="absolute -right-8 -top-8 w-32 h-32 bg-pink-500/10 rounded-full blur-3xl group-hover:bg-pink-500/20 transition-colors duration-500"></div>
+        <div class="w-12 h-12 rounded-2xl bg-gradient-to-br from-pink-500/20 to-pink-600/10 flex items-center justify-center text-pink-400 mb-4 border border-pink-500/20 shadow-inner group-hover:scale-110 group-hover:rotate-6 transition-all duration-300"><i class="fas fa-hand-holding-usd text-xl"></i></div>
+        <p class="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-1.5">Выплачено</p>
+        <p class="text-3xl font-black text-white drop-shadow-md tracking-tight">${state.admin.stats.totalPaid.toLocaleString(undefined, {maximumFractionDigits:2})} <span class="text-xs text-pink-400 font-bold align-top ml-0.5">USDT</span></p>
+      </div>
+    </div>
+    
+    <div class="flex items-center space-x-3 mb-4 animate-slide-up delay-225">
+       <div class="w-10 h-10 rounded-xl bg-teal-500/10 flex items-center justify-center text-teal-400 border border-teal-500/20 shadow-inner"><i class="fas fa-history text-lg"></i></div>
+       <h2 class="text-base font-bold text-white tracking-wide">Последние действия</h2>
+    </div>
+    <div class="glass-premium rounded-3xl overflow-hidden animate-slide-up delay-300">
+      ${state.admin.recentActivity.length === 0 ? '<div class="p-8 text-center text-slate-500 text-sm font-medium"><i class="fas fa-box-open text-3xl mb-3 block opacity-50"></i>Нет активности</div>' : ''}
+      ${state.admin.recentActivity.slice(0, 5).map((act, i) => `
+        <div class="p-4 border-b border-slate-700/50 flex justify-between items-center hover:bg-slate-700/30 transition-colors group animate-slide-right" style="animation-delay: ${i*100+300}ms">
+          <div class="flex items-center space-x-4">
+            <div class="w-2.5 h-2.5 rounded-full bg-teal-400 shadow-[0_0_10px_rgba(45,212,191,0.8)] group-hover:scale-150 group-hover:bg-blue-400 transition-all duration-300"></div>
+            <p class="text-sm text-slate-200 font-medium">${act.text}</p>
+          </div>
+          <span class="text-[10px] text-slate-500 font-mono bg-slate-900/80 px-2.5 py-1.5 rounded-lg border border-slate-800 shadow-inner">${act.time}</span>
+        </div>
+      `).join('')}
+    </div>
+  `;
+}
+
+window.toggleUserBan = async (uId) => {
+  uId = Number(uId);
+  if (uId === currentUser.id) {
+      state.user.status = state.user.status === 'active' ? 'banned' : 'active';
+      showToast(state.user.status === 'banned' ? 'Вы забанили сами себя!' : 'Вы разбанены');
+      saveState();
+      checkAccess();
+  } else {
+      const u = state.admin.users.find(user => user.id === uId);
+      if(u) {
+          u.status = u.status === 'active' ? 'banned' : 'active';
+          showToast(`Пользователь ${u.name} ${u.status === 'banned' ? 'забанен' : 'разбанен'}`);
+          saveState();
+          
+          const targetDoc = await User.findOne({ id: uId });
+          if(targetDoc) {
+             targetDoc.data.user.status = u.status;
+             await User.updateOne({ id: uId }, { $set: { data: targetDoc.data } });
+          }
+      }
+  }
+  renderAdminTab('users');
+};
+
+window.openUserDetailsModal = async (uId) => {
+    uId = Number(uId);
+    triggerHaptic('light');
+    let u;
+    if (uId === currentUser.id) {
+        u = { id: currentUser.id, name: currentUser.first_name, username: currentUser.username || 'guest', balance: state.user.balance, status: state.user.status, joined: state.user.joinedDate };
+    } else {
+        u = state.admin.users.find(user => user.id === uId);
+    }
+    
+    if(!u) return;
+
+    const statusColor = u.status === 'active' ? 'text-green-400 bg-green-500/10 border-green-500/20' : 'text-red-400 bg-red-500/10 border-red-500/20';
+    const statusText = u.status === 'active' ? 'Активен' : 'Заблокирован';
+    const statusIcon = u.status === 'active' ? 'fa-check-circle' : 'fa-ban';
+
+    modalContent.innerHTML = `
+      <div class="relative overflow-hidden -mx-6 -mt-6 p-6 mb-6 rounded-t-3xl bg-gradient-to-br from-slate-800 to-slate-900 border-b border-slate-700/50">
+        <div class="absolute -right-10 -top-10 w-32 h-32 bg-teal-500/10 rounded-full blur-3xl pointer-events-none"></div>
+        <div class="absolute -left-10 -bottom-10 w-32 h-32 bg-blue-500/10 rounded-full blur-3xl pointer-events-none"></div>
+        
+        <div class="flex justify-between items-start relative z-10 mb-4">
+            <h3 class="text-[10px] font-bold text-slate-400 uppercase tracking-widest bg-slate-900/50 px-2 py-1 rounded">Профиль юзера</h3>
+            <button onclick="window.closeModal()" class="w-8 h-8 rounded-full bg-slate-800/80 flex items-center justify-center text-slate-400 hover:text-white hover:bg-slate-700 transition-colors backdrop-blur-sm shadow-inner border border-slate-700"><i class="fas fa-times"></i></button>
+        </div>
+        
+        <div class="flex items-center space-x-4 relative z-10">
+           <div class="w-16 h-16 rounded-2xl ${u.status === 'banned' ? 'bg-red-500/20 border border-red-500/50 text-red-400' : 'bg-gradient-to-br from-teal-400 to-blue-500 text-white border-2 border-slate-700 shadow-[0_0_20px_rgba(45,212,191,0.3)]'} flex items-center justify-center font-black text-2xl shrink-0 transform -rotate-3 overflow-hidden">
+              ${u.status === 'banned' ? '<i class="fas fa-ban drop-shadow-md"></i>' : u.name.charAt(0)}
+           </div>
+           <div class="min-w-0 flex-1">
+              <h4 class="font-black text-white text-lg truncate tracking-tight">${u.name}</h4>
+              <p class="text-xs text-teal-400 truncate mt-0.5 font-medium">@${u.username}</p>
+           </div>
+        </div>
+      </div>
+
+      <div class="space-y-2.5 mb-6 text-sm px-1">
+         <div class="flex justify-between items-center bg-slate-800/50 p-3.5 rounded-xl border border-slate-700/50 shadow-sm hover:border-slate-600 transition-colors">
+            <span class="text-slate-400 text-xs font-bold flex items-center"><i class="fas fa-id-badge w-5 text-center text-slate-500"></i> ID профиля</span>
+            <div class="flex items-center space-x-2">
+                <span class="text-white font-mono text-xs">${u.id}</span>
+                <button onclick="navigator.clipboard.writeText('${u.id}'); showToast('ID скопирован!')" class="w-7 h-7 rounded-lg bg-slate-900 flex items-center justify-center text-teal-400 hover:text-white hover:bg-teal-500 transition-colors border border-slate-700 tap-effect shadow-inner"><i class="fas fa-copy text-[10px]"></i></button>
+            </div>
+         </div>
+         <div class="flex justify-between items-center bg-slate-800/50 p-3.5 rounded-xl border border-slate-700/50 shadow-sm hover:border-slate-600 transition-colors">
+            <span class="text-slate-400 text-xs font-bold flex items-center"><i class="fas fa-wallet w-5 text-center text-teal-500/50"></i> Баланс</span>
+            <span class="text-teal-400 font-black text-sm drop-shadow-sm">${u.balance.toFixed(2)} <span class="text-[9px] font-bold text-teal-500">USDT</span></span>
+         </div>
+         <div class="flex justify-between items-center bg-slate-800/50 p-3.5 rounded-xl border border-slate-700/50 shadow-sm hover:border-slate-600 transition-colors">
+            <span class="text-slate-400 text-xs font-bold flex items-center"><i class="fas fa-shield-alt w-5 text-center text-slate-500"></i> Статус</span>
+            <span class="px-2.5 py-1 rounded-md text-[9px] font-bold border ${statusColor} flex items-center uppercase tracking-wider shadow-inner"><i class="fas ${statusIcon} mr-1.5"></i>${statusText}</span>
+         </div>
+         <div class="flex justify-between items-center bg-slate-800/50 p-3.5 rounded-xl border border-slate-700/50 shadow-sm hover:border-slate-600 transition-colors">
+            <span class="text-slate-400 text-xs font-bold flex items-center"><i class="fas fa-calendar-alt w-5 text-center text-slate-500"></i> Регистрация</span>
+            <span class="text-white text-[11px] font-medium font-mono bg-slate-900/50 px-2 py-1 rounded border border-slate-800">${u.joined || 'Неизвестно'}</span>
+         </div>
+      </div>
+
+      <div class="grid grid-cols-2 gap-3 px-1 pb-1">
+         <button onclick="window.openEditBalanceModal('${u.id}')" class="py-3.5 bg-slate-800 hover:bg-slate-700 border border-slate-600 text-white rounded-xl font-bold text-xs tap-effect transition-colors shadow-sm group">
+            <i class="fas fa-pencil-alt mr-1.5 text-slate-400 group-hover:text-white transition-colors"></i> Изменить баланс
+         </button>
+         <button onclick="window.toggleUserBanFromModal('${u.id}')" class="py-3.5 ${u.status === 'active' ? 'bg-red-500/10 text-red-400 border border-red-500/30 hover:bg-red-500/20 shadow-red-500/10' : 'bg-green-500/10 text-green-400 border border-green-500/30 hover:bg-green-500/20 shadow-green-500/10'} rounded-xl font-bold text-xs tap-effect transition-colors shadow-sm">
+            <i class="fas ${u.status === 'active' ? 'fa-ban' : 'fa-check'} mr-1.5"></i> ${u.status === 'active' ? 'Забанить' : 'Разбанить'}
+         </button>
+      </div>
+    `;
+    
+    modalOverlay.classList.remove('hidden');
+    setTimeout(() => { 
+        modalOverlay.classList.remove('opacity-0'); 
+        modalContent.classList.remove('scale-95'); 
+        modalContent.classList.add('animate-pop-in'); 
+    }, 10);
+};
+
+window.toggleUserBanFromModal = async (uId) => {
+    uId = Number(uId);
+    await window.toggleUserBan(uId);
+    window.openUserDetailsModal(uId);
+};
+
+window.openEditBalanceModal = async (uId) => {
+    uId = Number(uId);
+    triggerHaptic('medium');
+    let uBalance = 0;
+    let uName = "";
+    if (uId === currentUser.id) {
+        uBalance = state.user.balance;
+        uName = currentUser.first_name;
+    } else {
+        const u = state.admin.users.find(user => user.id === uId);
+        if(u) { uBalance = u.balance; uName = u.name; }
+        else return;
+    }
+
+    modalContent.innerHTML = `
+      <h3 class="text-xl font-bold text-white mb-4">Изменить баланс</h3>
+      <p class="text-xs text-slate-400 mb-4">Пользователь: <span class="text-white font-bold">${uName}</span></p>
+      <input type="number" id="edit-balance-input" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-3 text-white text-sm focus:border-teal-500 outline-none mb-6" value="${uBalance}" step="0.1">
+      <div class="flex space-x-3">
+        <button onclick="window.openUserDetailsModal(${uId})" class="flex-1 py-3 bg-slate-800 text-white rounded-xl font-bold text-sm tap-effect">Назад</button>
+        <button onclick="window.saveUserBalance('${uId}')" class="flex-1 py-3 bg-teal-500 text-slate-900 rounded-xl font-bold text-sm shadow-lg shadow-teal-500/20 tap-effect">Сохранить</button>
+      </div>
+    `;
+};
+
+window.saveUserBalance = async (uId) => {
+    uId = Number(uId);
+    const newBalance = parseFloat(document.getElementById('edit-balance-input').value);
+    if(isNaN(newBalance) || newBalance < 0) return showToast('Введите корректный баланс');
+
+    if (uId === currentUser.id) {
+        state.user.balance = newBalance;
+        saveState();
+        updateHeaderUI();
+    } else {
+        const u = state.admin.users.find(user => user.id === uId);
+        if(u) {
+            u.balance = newBalance;
+            saveState();
+            const targetDoc = await User.findOne({ id: uId });
+            if (targetDoc) {
+                targetDoc.data.user.balance = newBalance;
+                await User.updateOne({ id: uId }, { $set: { data: targetDoc.data } });
+            }
+        }
+    }
+    renderAdminTab('users');
+    window.openUserDetailsModal(uId);
+    showToast('Баланс успешно изменен');
+};
+
+let adminUsersPage = 1;
+let adminUsersSearch = '';
+
+window.changeAdminUsersPage = (delta) => {
+  adminUsersPage += delta;
+  updateAdminUsersList();
+};
+
+function renderAdminUsers() {
+  setTimeout(attachAdminUsersEvents, 0);
+  return `
+    <div class="mb-8 flex flex-col md:flex-row md:items-end justify-between gap-4 animate-slide-up relative z-10">
+      <div>
+        <h1 class="text-3xl font-black text-transparent bg-clip-text bg-gradient-to-r from-teal-400 via-blue-400 to-purple-500 tracking-tight mb-1">Пользователи</h1>
+        <p class="text-slate-400 text-[10px] font-bold uppercase tracking-widest flex items-center"><i class="fas fa-users mr-2 text-teal-500/70"></i>Управление базой</p>
+      </div>
+      <div class="relative w-full md:w-80 group">
+        <div class="absolute inset-0 bg-teal-500/10 rounded-2xl blur-md group-hover:bg-teal-500/20 transition-colors duration-500 z-0"></div>
+        <i class="fas fa-search absolute left-4 top-1/2 transform -translate-y-1/2 text-teal-500/50 text-sm z-10 group-focus-within:text-teal-400 transition-colors"></i>
+        <input type="text" id="admin-search-input" placeholder="Поиск по ID, имени, @username..." class="relative z-10 w-full glass-premium rounded-2xl py-3.5 pl-11 pr-4 text-sm text-white focus:border-teal-400 focus:shadow-[0_0_15px_rgba(45,212,191,0.2)] outline-none transition-all placeholder-slate-500">
+      </div>
+    </div>
+    <div id="admin-users-container" class="animate-slide-up delay-100 relative z-10">
+    </div>
+  `;
+}
+
+function attachAdminUsersEvents() {
+  const searchInput = document.getElementById('admin-search-input');
+  if (searchInput) {
+    searchInput.value = adminUsersSearch;
+    searchInput.addEventListener('input', (e) => {
+      adminUsersSearch = e.target.value.toLowerCase();
+      adminUsersPage = 1;
+      updateAdminUsersList();
+    });
+    if (adminUsersSearch) {
+      searchInput.focus();
+    }
+  }
+  updateAdminUsersList();
+}
+
+function updateAdminUsersList() {
+  const container = document.getElementById('admin-users-container');
+  if (!container) return;
+
+  const allUsers = [
+    { id: currentUser.id, name: currentUser.first_name, username: currentUser.username || 'guest', balance: state.user.balance, status: state.user.status, joined: state.user.joinedDate },
+    ...state.admin.users
+  ];
+
+  const search = (adminUsersSearch || '').toLowerCase();
+  const filtered = allUsers.filter(u => {
+    const uId = String(u.id || '');
+    const uName = String(u.name || '').toLowerCase();
+    const uUser = String(u.username || '').toLowerCase();
+    return uId.includes(search) || uName.includes(search) || uUser.includes(search);
+  });
+
+  const itemsPerPage = 999999;
+  const totalPages = Math.ceil(filtered.length / itemsPerPage) || 1;
+  if (adminUsersPage > totalPages) adminUsersPage = totalPages;
+  if (adminUsersPage < 1) adminUsersPage = 1;
+
+  const currentUsers = filtered.slice((adminUsersPage - 1) * itemsPerPage, adminUsersPage * itemsPerPage);
+
+  let html = '<div class="grid grid-cols-1 md:grid-cols-2 gap-4 pb-24">';
+  if (currentUsers.length === 0) {
+      html += '<div class="col-span-full text-center py-12 glass-premium rounded-3xl text-slate-500 text-sm font-medium"><i class="fas fa-ghost text-3xl mb-3 block opacity-50"></i>Пользователи не найдены</div>';
+  }
+
+  currentUsers.forEach((u, index) => {
+    const safeName = String(u.name || 'User ' + u.id);
+    const initial = safeName.charAt(0).toUpperCase();
+    const safeBalance = Number(u.balance || 0).toFixed(2);
+    const isBanned = u.status === 'banned';
+    
+    const statusBadge = isBanned ? '<span class="px-2 py-0.5 rounded-md text-[9px] bg-red-500/20 text-red-400 border border-red-500/30 uppercase font-bold tracking-wider ml-2 shadow-inner"><i class="fas fa-ban mr-1"></i>Бан</span>' : '';
+    
+    html += `
+      <div onclick="window.openUserDetailsModal('${u.id}')" class="glass-premium p-4 rounded-2xl flex items-center justify-between hover-glow transition-all cursor-pointer tap-effect group relative overflow-hidden animate-slide-up ${String(u.id) === String(currentUser.id) ? 'border-teal-500/50 bg-teal-500/10' : ''}" style="animation-delay: ${index * 50}ms">
+        <div class="absolute inset-0 bg-gradient-to-r from-white/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none"></div>
+        <div class="flex items-center space-x-4 min-w-0 w-full relative z-10">
+          <div class="w-12 h-12 rounded-2xl ${isBanned ? 'bg-red-500/10 border border-red-500/30 text-red-400' : 'bg-gradient-to-br from-slate-700 to-slate-800 border border-slate-600 text-white shadow-inner'} flex items-center justify-center font-black text-lg relative shrink-0 group-hover:scale-110 transition-transform duration-300">
+            ${isBanned ? '<i class="fas fa-ban"></i>' : initial}
+            ${String(u.id) === String(currentUser.id) ? '<div class="absolute -top-1.5 -right-1.5 w-4 h-4 bg-teal-400 rounded-full border-[3px] border-[#0f172a] shadow-[0_0_10px_rgba(45,212,191,0.8)]"></div>' : ''}
+          </div>
+          <div class="min-w-0 flex-1">
+            <p class="font-black text-sm ${isBanned ? 'text-slate-500 line-through' : 'text-white'} truncate flex items-center tracking-wide">${safeName} ${statusBadge}</p>
+            <p class="text-[10px] text-slate-400 mt-1 truncate font-mono">ID: ${u.id} ${u.username && u.username !== 'unknown' ? `<span class="text-[9px] text-slate-500 ml-1.5 bg-slate-900/80 px-1.5 py-0.5 rounded-md border border-slate-700">@${u.username}</span>` : ''}</p>
+          </div>
+          <div class="text-right shrink-0 flex flex-col justify-center items-end mr-3">
+            <p class="font-black text-teal-400 text-base drop-shadow-[0_2px_4px_rgba(0,0,0,0.5)]">${safeBalance}</p>
+            <p class="text-[8px] text-slate-500 uppercase font-bold tracking-widest mt-0.5">USDT</p>
+          </div>
+          <div class="w-8 h-8 rounded-full bg-slate-900/80 flex items-center justify-center text-slate-500 group-hover:text-teal-400 group-hover:bg-teal-500/20 transition-all shrink-0 border border-slate-700 group-hover:border-teal-500/50 shadow-inner">
+            <i class="fas fa-chevron-right text-xs"></i>
+          </div>
+        </div>
+      </div>
+    `;
+  });
+  html += '</div>';
+
+  if (totalPages > 1) {
+    html += `
+      <div class="flex items-center justify-between mt-4 px-1 pb-6 relative z-10 animate-slide-up delay-200">
+        <button onclick="window.changeAdminUsersPage(-1)" class="px-5 py-2.5 bg-slate-800 rounded-xl text-[11px] font-bold text-slate-400 hover:text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed tap-effect border border-slate-700 shadow-sm" ${adminUsersPage <= 1 ? 'disabled' : ''}>
+          <i class="fas fa-chevron-left mr-2"></i> Назад
+        </button>
+        <span class="text-[11px] text-slate-400 font-bold bg-slate-900/80 px-4 py-2 rounded-xl border border-slate-800 shadow-inner">Стр. ${adminUsersPage} из ${totalPages}</span>
+        <button onclick="window.changeAdminUsersPage(1)" class="px-5 py-2.5 bg-slate-800 rounded-xl text-[11px] font-bold text-slate-400 hover:text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed tap-effect border border-slate-700 shadow-sm" ${adminUsersPage >= totalPages ? 'disabled' : ''}>
+          Вперед <i class="fas fa-chevron-right ml-2"></i>
+        </button>
+      </div>
+    `;
+  }
+  container.innerHTML = html;
+}
+
+window.openAdminTaskModal = (taskId = null) => {
+    triggerHaptic('medium');
+    let task = taskId ? state.tasks.find(t => t.id === taskId) : { id: 't'+Date.now(), title: '', reward: 1.0, icon: 'fa-telegram', type: 'tg', url: '' };
+
+    modalContent.innerHTML = `
+      <h3 class="text-xl font-bold text-white mb-4">${taskId ? 'Редактировать задание' : 'Новое задание'}</h3>
+      <input type="hidden" id="admin-task-id" value="${task.id}">
+      <div class="space-y-3 mb-6">
+         <div>
+            <label class="text-xs text-slate-400 mb-1 block">Название</label>
+            <input type="text" id="admin-task-title" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-3 text-white text-sm focus:border-teal-500 outline-none" value="${task.title}" placeholder="Например: Подписка на канал">
+         </div>
+         <div class="grid grid-cols-2 gap-3">
+             <div>
+                <label class="text-xs text-slate-400 mb-1 block">Награда (USDT)</label>
+                <input type="number" id="admin-task-reward" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-3 text-white text-sm focus:border-teal-500 outline-none" value="${task.reward}" step="0.1">
+             </div>
+             <div>
+                <label class="text-xs text-slate-400 mb-1 block">Тип платформы</label>
+                <select id="admin-task-type" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-3 text-white text-sm focus:border-teal-500 outline-none">
+                    <option value="tg" ${task.type==='tg'?'selected':''}>Telegram</option>
+                    <option value="yt" ${task.type==='yt'?'selected':''}>YouTube</option>
+                    <option value="x" ${task.type==='x'?'selected':''}>X (Twitter)</option>
+                </select>
+             </div>
+         </div>
+         <div class="grid grid-cols-2 gap-3">
+             <div class="col-span-2">
+                <label class="text-xs text-slate-400 mb-1 block">Ссылка URL</label>
+                <input type="text" id="admin-task-url" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-3 text-white text-sm focus:border-teal-500 outline-none" value="${task.url}" placeholder="https://...">
+             </div>
+             <div class="col-span-2">
+                <label class="text-xs text-slate-400 mb-1 block">Иконка (класс FontAwesome)</label>
+                <input type="text" id="admin-task-icon" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-3 text-white text-sm focus:border-teal-500 outline-none" value="${task.icon}" placeholder="fa-telegram">
+             </div>
+             <div class="col-span-2">
+                <label class="text-xs text-slate-400 mb-1 block">Лимит выполнений (0 = безлимит)</label>
+                <input type="number" id="admin-task-max" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-3 text-white text-sm focus:border-teal-500 outline-none" value="${task.maxUses || 0}" min="0">
+             </div>
+         </div>
+      </div>
+      <div class="flex space-x-3">
+         <button onclick="window.closeModal()" class="flex-1 py-3 bg-slate-800 text-white rounded-xl font-bold text-sm tap-effect">Отмена</button>
+         <button onclick="window.saveAdminTask()" class="flex-1 py-3 bg-teal-500 text-slate-900 rounded-xl font-bold text-sm shadow-lg shadow-teal-500/20 tap-effect">Сохранить</button>
+      </div>
+    `;
+    modalOverlay.classList.remove('hidden');
+    setTimeout(() => { 
+        modalOverlay.classList.remove('opacity-0'); 
+        modalContent.classList.remove('scale-95'); 
+        modalContent.classList.add('animate-pop-in'); 
+    }, 10);
+};
+
+window.saveAdminTask = () => {
+    const id = document.getElementById('admin-task-id').value;
+    const title = document.getElementById('admin-task-title').value.trim();
+    const reward = parseFloat(document.getElementById('admin-task-reward').value);
+    const icon = document.getElementById('admin-task-icon').value.trim();
+    const url = document.getElementById('admin-task-url').value.trim();
+    const type = document.getElementById('admin-task-type').value;
+    const maxUses = parseInt(document.getElementById('admin-task-max').value) || 0;
+
+    if(!title || !url) { showToast('Заполните название и ссылку'); return; }
+
+    const existingIdx = state.tasks.findIndex(t => t.id === id);
+    const currentUses = existingIdx >= 0 ? (state.tasks[existingIdx].currentUses || 0) : 0;
+    const taskData = { id, title, reward, icon, url, type, maxUses, currentUses, status: 'todo' };
+
+    if(existingIdx >= 0) {
+        taskData.status = state.tasks[existingIdx].status;
+        state.tasks[existingIdx] = taskData;
+    } else {
+        state.tasks.push(taskData);
+    }
+
+    saveState();
+    window.closeModal();
+    renderAdminTab('tasks');
+    showToast('Задание успешно сохранено');
+};
+
+window.deleteAdminTask = (id) => {
+    if(confirm('Вы уверены, что хотите удалить это задание?')) {
+        state.tasks = state.tasks.filter(t => t.id !== id);
+        saveState();
+        renderAdminTab('tasks');
+        showToast('Задание удалено');
+    }
+};
+
+function renderAdminTasks() {
+  let html = `
+    <div class="mb-8 flex justify-between items-end animate-slide-up">
+      <div>
+        <h1 class="text-3xl font-black text-transparent bg-clip-text bg-gradient-to-r from-teal-400 via-blue-400 to-purple-500 tracking-tight mb-1">Задания</h1>
+        <p class="text-slate-400 text-[10px] font-bold uppercase tracking-widest flex items-center"><i class="fas fa-tasks mr-2 text-teal-500/70"></i>Настройка способов заработка</p>
+      </div>
+      <button onclick="window.openAdminTaskModal()" class="bg-gradient-to-r from-teal-500 to-emerald-500 text-slate-900 px-4 py-2.5 rounded-xl font-black text-xs hover:from-teal-400 hover:to-emerald-400 transition-all shadow-[0_5px_15px_rgba(20,184,166,0.3)] tap-effect uppercase tracking-widest border border-teal-400/50">
+        <i class="fas fa-plus mr-1.5"></i>Новое
+      </button>
+    </div>
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 animate-slide-up delay-100">
+  `;
+
+  if (state.tasks.length === 0) {
+     html += '<div class="col-span-full text-center py-12 glass-premium rounded-3xl text-slate-500 text-sm font-medium"><i class="fas fa-clipboard-list text-3xl mb-3 block opacity-50"></i>Заданий пока нет</div>';
+  }
+
+  state.tasks.forEach((t, i) => {
+     html += `
+        <div class="glass-premium p-5 rounded-2xl flex flex-col justify-between hover-glow transition-all group relative overflow-hidden animate-slide-up" style="animation-delay: ${i*50+150}ms">
+          <div class="absolute inset-0 bg-gradient-to-br from-white/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none"></div>
+          <div class="flex items-start justify-between mb-4 relative z-10">
+            <div class="flex items-center space-x-4">
+              <div class="w-12 h-12 rounded-2xl bg-slate-800 flex items-center justify-center text-xl text-slate-300 shrink-0 border border-slate-700 shadow-inner group-hover:scale-110 group-hover:text-teal-400 transition-all duration-300">
+                <i class="fab ${t.icon}"></i>
+              </div>
+              <div class="min-w-0 pr-2">
+                <h3 class="font-black text-sm text-white truncate w-full tracking-wide" title="${t.title}">${t.title}</h3>
+                <span class="text-[11px] text-teal-400 font-bold bg-teal-500/10 px-2 py-0.5 rounded-md border border-teal-500/20 inline-block mt-1">Награда: ${t.reward} USDT</span>
+              </div>
+            </div>
+            <div class="flex space-x-2 shrink-0">
+              <button onclick="window.openAdminTaskModal('${t.id}')" class="w-9 h-9 rounded-xl bg-slate-800 text-slate-400 hover:text-white hover:bg-blue-500/50 border border-slate-700 hover:border-blue-500/50 transition-colors tap-effect text-sm shadow-inner"><i class="fas fa-edit"></i></button>
+              <button onclick="window.deleteAdminTask('${t.id}')" class="w-9 h-9 rounded-xl bg-slate-800 text-slate-400 hover:text-white hover:bg-red-500/50 border border-slate-700 hover:border-red-500/50 transition-colors tap-effect text-sm shadow-inner"><i class="fas fa-trash"></i></button>
+            </div>
+          </div>
+          <div class="bg-slate-900/80 rounded-xl p-3 flex items-center justify-between border border-slate-800 shadow-inner relative z-10">
+            <span class="text-[10px] text-slate-500 truncate mr-3 font-mono bg-black/40 px-2 py-1 rounded">${t.url}</span>
+            <div class="flex items-center space-x-2 shrink-0">
+              <span class="text-[10px] text-slate-400 font-bold bg-slate-800 px-2.5 py-1 rounded-md border border-slate-700"><i class="fas fa-users mr-1.5 text-teal-500/70"></i>${t.currentUses || 0}/${t.maxUses || '∞'}</span>
+              <span class="text-[9px] bg-slate-700 text-slate-300 px-2.5 py-1 rounded-md uppercase font-bold tracking-widest border border-slate-600">${t.type}</span>
+            </div>
+          </div>
+        </div>
+     `;
+  });
+  html += '</div>';
+  return html;
+}
+
+window.processDeposit = async (dId, action) => {
+  const pdIndex = state.admin.pendingDeposits.findIndex(d => d.id === dId);
+  if (pdIndex === -1) return;
+  const pd = state.admin.pendingDeposits[pdIndex];
+  state.admin.pendingDeposits.splice(pdIndex, 1);
+
+  let targetUserDoc = null;
+  let targetState = null;
+
+  if (pd.userId === currentUser.id) {
+      targetState = state;
+  } else {
+      targetUserDoc = await User.findOne({ id: pd.userId });
+      if(targetUserDoc) targetState = targetUserDoc.data;
+  }
+
+  if(targetState) {
+      const ud = targetState.deposits?.find(d => d.id === dId);
+      if (action === 'approve') {
+          if(ud) ud.status = 'completed';
+          targetState.user.balance += pd.amount;
+          state.admin.recentActivity.unshift({ time: 'Только что', text: `Пополнение ${pd.amount} USDT подтверждено` });
+          showToast('Пополнение подтверждено, баланс начислен');
+      } else {
+          if(ud) ud.status = 'rejected';
+          state.admin.recentActivity.unshift({ time: 'Только что', text: `Пополнение ${pd.amount} USDT отклонено` });
+          showToast('Пополнение отклонено');
+      }
+      
+      if (pd.userId === currentUser.id) {
+          saveState();
+          updateHeaderUI();
+      } else {
+          await User.updateOne({ id: pd.userId }, { $set: { data: targetState } });
+          saveState(); // сохранить удаление из pending
+      }
+      renderAdminTab('finances');
+  }
+};
+
+window.processWithdrawal = async (wId, action) => {
+  const pwIndex = state.admin.pendingWithdrawals.findIndex(w => w.id === wId);
+  if (pwIndex === -1) return;
+  const pw = state.admin.pendingWithdrawals[pwIndex];
+  state.admin.pendingWithdrawals.splice(pwIndex, 1);
+  
+  let targetUserDoc = null;
+  let targetState = null;
+
+  if (pw.userId === currentUser.id) {
+      targetState = state;
+  } else {
+      targetUserDoc = await User.findOne({ id: pw.userId });
+      if(targetUserDoc) targetState = targetUserDoc.data;
+  }
+
+  if (targetState) {
+      const uw = targetState.withdrawals?.find(w => w.id === wId);
+      if (action === 'approve') {
+        if(uw) uw.status = 'completed';
+        state.admin.stats.totalPaid += pw.amount;
+        state.admin.recentActivity.unshift({ time: 'Только что', text: `Выплата ${pw.amount} USDT подтверждена` });
+        showToast('Выплата подтверждена');
+      } else {
+        if(uw) uw.status = 'rejected';
+        targetState.user.balance += pw.amount; // Возврат средств
+        state.admin.recentActivity.unshift({ time: 'Только что', text: `Выплата ${pw.amount} USDT отклонена` });
+        showToast('Выплата отклонена, средства возвращены юзеру');
+      }
+      
+      if (pw.userId === currentUser.id) {
+          saveState();
+          updateHeaderUI();
+      } else {
+          await User.updateOne({ id: pw.userId }, { $set: { data: targetState } });
+          saveState(); // сохранить удаление из pending
+      }
+      renderAdminTab('finances');
+  }
+};
+
+function renderAdminFinances() {
+  const pendingDeposits = state.admin.pendingDeposits || [];
+  
+  return `
+    <div class="mb-8 animate-slide-up">
+      <h1 class="text-3xl font-black text-transparent bg-clip-text bg-gradient-to-r from-teal-400 via-blue-400 to-purple-500 tracking-tight mb-1">Финансы</h1>
+      <p class="text-slate-400 text-[10px] font-bold uppercase tracking-widest flex items-center"><i class="fas fa-money-bill-wave mr-2 text-teal-500/70"></i>Управление пополнениями и выплатами</p>
+    </div>
+    
+    <!-- Pending Deposits -->
+    <h2 class="text-sm font-bold text-white mb-4 flex items-center space-x-2 animate-slide-up delay-75">
+      <div class="w-8 h-8 rounded-lg bg-blue-500/10 flex items-center justify-center text-blue-400 border border-blue-500/20"><i class="fas fa-arrow-down"></i></div>
+      <span>Ожидают пополнения <span class="bg-blue-500 text-white text-[10px] px-2 py-0.5 rounded-full ml-1">${pendingDeposits.length}</span></span>
+    </h2>
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mb-10 animate-slide-up delay-100">
+      ${pendingDeposits.length === 0 ? `<div class="col-span-full p-8 text-center glass-premium rounded-2xl text-slate-500 text-sm font-medium"><i class="fas fa-check-circle text-3xl mb-3 block opacity-50"></i>Нет заявок на пополнение</div>` : ''}
+      ${pendingDeposits.map((d, i) => `
+        <div class="glass-premium p-5 rounded-2xl flex flex-col justify-between gap-4 relative overflow-hidden group hover:border-blue-500/40 transition-all animate-slide-up" style="animation-delay: ${i*50+150}ms">
+          <div class="absolute -right-10 -top-10 w-32 h-32 bg-blue-500/10 rounded-full blur-3xl pointer-events-none"></div>
+          <div>
+            <div class="flex items-center space-x-3 mb-3 relative z-10">
+              <div class="w-10 h-10 rounded-full bg-slate-800 flex items-center justify-center font-bold text-white border border-slate-700 shadow-inner">
+                 ${d.user.charAt(0).toUpperCase()}
+              </div>
+              <div>
+                 <span class="font-black text-white text-sm block tracking-wide">${d.user}</span>
+                 <span class="bg-blue-500/10 text-blue-400 text-[9px] font-bold uppercase tracking-widest px-1.5 py-0.5 rounded border border-blue-500/20 mt-1 inline-block">Проверка</span>
+              </div>
+            </div>
+            <div class="flex flex-col space-y-2 text-xs mb-2 relative z-10 bg-slate-900/60 p-3 rounded-xl border border-slate-800">
+              <div class="flex justify-between items-center"><span class="text-slate-400 font-bold uppercase text-[9px] tracking-widest">Сумма</span> <span class="text-blue-400 font-black text-sm">+${d.amount} USDT</span></div>
+              <div class="flex justify-between items-center"><span class="text-slate-400 font-bold uppercase text-[9px] tracking-widest">Метод</span> <span class="text-white font-bold uppercase">${d.method}</span></div>
+              <div class="flex justify-between items-center mt-1"><span class="text-slate-400 font-bold uppercase text-[9px] tracking-widest">Memo</span> <span class="text-white font-mono bg-black/40 px-1.5 py-0.5 rounded select-all">${d.memo || 'Нет'}</span></div>
+            </div>
+          </div>
+          <div class="flex space-x-3 w-full relative z-10">
+            <button onclick="window.processDeposit('${d.id}', 'approve')" class="flex-1 py-2.5 bg-blue-500 hover:bg-blue-400 text-white rounded-xl text-xs font-black transition-colors tap-effect shadow-[0_5px_15px_rgba(59,130,246,0.3)] uppercase tracking-wider">Одобрить</button>
+            <button onclick="window.processDeposit('${d.id}', 'reject')" class="flex-1 py-2.5 bg-slate-800 hover:bg-red-500 hover:text-white text-slate-400 border border-slate-700 rounded-xl text-xs font-black transition-colors tap-effect shadow-inner uppercase tracking-wider">Отклонить</button>
+          </div>
+        </div>
+      `).join('')}
+    </div>
+
+    <!-- Pending Withdrawals -->
+    <h2 class="text-sm font-bold text-white mb-4 flex items-center space-x-2 animate-slide-up delay-200">
+      <div class="w-8 h-8 rounded-lg bg-yellow-500/10 flex items-center justify-center text-yellow-500 border border-yellow-500/20"><i class="fas fa-arrow-up"></i></div>
+      <span>Ожидают выплаты <span class="bg-yellow-500 text-slate-900 text-[10px] px-2 py-0.5 rounded-full ml-1 font-bold">${state.admin.pendingWithdrawals.length}</span></span>
+    </h2>
+    <div class="space-y-4 animate-slide-up delay-300 pb-20">
+      ${state.admin.pendingWithdrawals.length === 0 ? `<div class="p-8 text-center glass-premium rounded-2xl text-slate-500 text-sm font-medium"><i class="fas fa-check-double text-3xl mb-3 block opacity-50"></i>Нет заявок на вывод</div>` : ''}
+      ${state.admin.pendingWithdrawals.map((w, i) => `
+        <div class="glass-premium p-5 rounded-2xl flex flex-col md:flex-row justify-between md:items-center gap-4 relative overflow-hidden group hover:border-yellow-500/40 transition-all animate-slide-up" style="animation-delay: ${i*50+300}ms">
+          <div class="absolute -left-10 -bottom-10 w-32 h-32 bg-yellow-500/10 rounded-full blur-3xl pointer-events-none"></div>
+          <div class="relative z-10 w-full md:w-auto flex-1">
+            <div class="flex items-center space-x-4 mb-3">
+              <div class="w-12 h-12 rounded-full bg-slate-800 flex items-center justify-center font-bold text-white border border-slate-700 shadow-inner shrink-0">
+                 ${w.user.charAt(0).toUpperCase()}
+              </div>
+              <div>
+                <div class="flex items-center space-x-2">
+                   <span class="font-black text-white text-base tracking-wide">${w.user}</span>
+                   <span class="bg-yellow-500/10 text-yellow-500 text-[9px] font-bold uppercase tracking-widest px-2 py-0.5 rounded border border-yellow-500/20">Ожидает</span>
+                </div>
+                <div class="text-[10px] text-slate-400 mt-1 font-mono">ID: ${w.userId}</div>
+              </div>
+            </div>
+            <div class="bg-slate-900/60 p-3 rounded-xl border border-slate-800 flex flex-col md:flex-row md:items-center justify-between gap-3">
+               <div class="flex items-center space-x-6">
+                  <div>
+                     <span class="text-slate-400 font-bold uppercase text-[9px] tracking-widest block mb-1">Сумма</span>
+                     <span class="text-teal-400 font-black text-lg">-${w.amount} USDT</span>
+                  </div>
+                  <div>
+                     <span class="text-slate-400 font-bold uppercase text-[9px] tracking-widest block mb-1">Сеть</span>
+                     <span class="text-white font-bold bg-slate-800 px-2.5 py-1 rounded text-xs border border-slate-700 uppercase">${w.network}</span>
+                  </div>
+               </div>
+               <div class="mt-2 md:mt-0 max-w-sm">
+                  <span class="text-slate-400 font-bold uppercase text-[9px] tracking-widest block mb-1">Адрес</span>
+                  <div class="text-xs text-white font-mono bg-black/40 p-2 rounded-lg border border-slate-800 break-all select-all shadow-inner">${w.address}</div>
+               </div>
+            </div>
+          </div>
+          <div class="flex md:flex-col space-x-3 md:space-x-0 md:space-y-3 w-full md:w-36 shrink-0 relative z-10">
+            <button onclick="window.processWithdrawal('${w.id}', 'approve')" class="flex-1 md:w-full py-3 bg-teal-500 hover:bg-teal-400 text-slate-900 rounded-xl text-xs font-black transition-colors tap-effect shadow-[0_5px_15px_rgba(20,184,166,0.3)] uppercase tracking-wider"><i class="fas fa-check mr-1.5"></i>Оплатить</button>
+            <button onclick="window.processWithdrawal('${w.id}', 'reject')" class="flex-1 md:w-full py-3 bg-slate-800 hover:bg-red-500 hover:text-white text-slate-400 border border-slate-700 rounded-xl text-xs font-black transition-colors tap-effect shadow-inner uppercase tracking-wider"><i class="fas fa-times mr-1.5"></i>Отклонить</button>
+          </div>
+        </div>
+      `).join('')}
+    </div>
+  `;
+}
+
+window.sendBroadcast = async () => {
+  const message = document.getElementById('broadcast-text').value.trim();
+  const imageUrl = document.getElementById('broadcast-image').value.trim();
+  const buttonText = document.getElementById('broadcast-btn-text').value.trim();
+  const buttonUrl = document.getElementById('broadcast-btn-url').value.trim();
+
+  if (!message) {
+    showToast('Введите текст рассылки');
+    return;
+  }
+
+  const btn = document.getElementById('send-broadcast-btn');
+  const originalText = btn.innerHTML;
+  btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>Отправка...';
+  btn.disabled = true;
+
+  try {
+    const res = await fetch(`${API_URL}/broadcast`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store, no-cache, must-revalidate' },
+      body: JSON.stringify({ message, imageUrl, buttonText, buttonUrl, adminId: currentUser.id })
+    });
+    
+    if (res.ok) {
+      const data = await res.json();
+      showToast(data.message || 'Рассылка успешно запущена!');
+      document.getElementById('broadcast-text').value = '';
+      document.getElementById('broadcast-image').value = '';
+      document.getElementById('broadcast-btn-text').value = '';
+      document.getElementById('broadcast-btn-url').value = '';
+      state.admin.recentActivity.unshift({ time: 'Только что', text: 'Запущена массовая рассылка' });
+      saveState();
+    } else {
+      showToast('Ошибка при запуске рассылки');
+    }
+  } catch (e) {
+    console.error(e);
+    showToast('Ошибка соединения с сервером');
+  } finally {
+    btn.innerHTML = originalText;
+    btn.disabled = false;
+  }
+};
+
+function renderAdminBroadcast() {
+  return `
+    <div class="mb-4 animate-slide-up relative z-10">
+      <h1 class="text-3xl font-black text-transparent bg-clip-text bg-gradient-to-r from-teal-400 via-blue-400 to-purple-500 tracking-tight mb-1">Рассылка</h1>
+      <p class="text-slate-400 text-[10px] font-bold uppercase tracking-widest flex items-center"><i class="fas fa-bullhorn mr-2 text-teal-500/70"></i>Отправка сообщений всем пользователям</p>
+    </div>
+
+    <div class="glass-premium rounded-[2rem] p-4 lg:p-5 relative overflow-hidden group hover:border-teal-500/40 transition-all duration-500 animate-slide-up delay-75 z-10">
+       <div class="absolute -right-10 -top-10 w-48 h-48 bg-teal-500/10 rounded-full blur-3xl pointer-events-none group-hover:bg-teal-500/20 transition-colors duration-700"></div>
+       <div class="absolute -left-10 -bottom-10 w-48 h-48 bg-blue-500/10 rounded-full blur-3xl pointer-events-none group-hover:bg-blue-500/20 transition-colors duration-700"></div>
+       
+       <div class="flex items-center space-x-3 mb-4 relative z-10">
+         <div class="w-10 h-10 rounded-2xl bg-gradient-to-br from-teal-500/20 to-blue-500/20 flex items-center justify-center text-xl text-teal-400 border border-teal-500/30 shadow-[0_0_20px_rgba(45,212,191,0.2)] group-hover:scale-110 transition-transform duration-500">
+           <i class="fas fa-paper-plane"></i>
+         </div>
+         <div>
+           <h2 class="text-lg font-black text-white tracking-wide">Создать сообщение</h2>
+           <p class="text-[9px] text-slate-400 font-bold uppercase tracking-widest">HTML поддерживается</p>
+         </div>
+       </div>
+       
+       <div class="space-y-3 relative z-10">
+          <div class="relative group/input">
+            <label class="block text-[9px] font-bold text-slate-400 uppercase tracking-widest mb-1.5 flex items-center"><i class="fas fa-comment-alt mr-2 text-slate-500"></i>Текст сообщения*</label>
+            <textarea id="broadcast-text" rows="3" class="w-full bg-slate-900/80 border border-slate-700 rounded-xl py-2.5 px-3 text-sm font-medium text-white focus:border-teal-400 focus:shadow-[0_0_15px_rgba(45,212,191,0.2)] outline-none transition-all resize-none" placeholder="<b>Жирный текст</b>\nОбычный текст..."></textarea>
+          </div>
+          
+          <div class="relative group/input">
+            <label class="block text-[9px] font-bold text-slate-400 uppercase tracking-widest mb-1.5 flex items-center"><i class="fas fa-image mr-2 text-slate-500"></i>URL картинки (необязательно)</label>
+            <div class="relative flex items-center group-focus-within/input:text-teal-400">
+              <i class="fas fa-link absolute left-3 text-slate-500 transition-colors"></i>
+              <input type="text" id="broadcast-image" class="w-full bg-slate-900/80 border border-slate-700 rounded-xl py-2.5 pl-9 pr-3 text-sm font-medium text-white focus:border-teal-400 focus:shadow-[0_0_15px_rgba(45,212,191,0.2)] outline-none transition-all font-mono" placeholder="https://...">
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+             <div class="relative group/input">
+                <label class="block text-[9px] font-bold text-slate-400 uppercase tracking-widest mb-1.5 flex items-center"><i class="fas fa-font mr-2 text-slate-500"></i>Текст кнопки (необяз.)</label>
+                <div class="relative flex items-center group-focus-within/input:text-blue-400">
+                  <i class="fas fa-keyboard absolute left-3 text-slate-500 transition-colors"></i>
+                  <input type="text" id="broadcast-btn-text" class="w-full bg-slate-900/80 border border-slate-700 rounded-xl py-2.5 pl-9 pr-3 text-sm font-medium text-white focus:border-blue-400 focus:shadow-[0_0_15px_rgba(59,130,246,0.2)] outline-none transition-all" placeholder="Играть">
+                </div>
+             </div>
+             <div class="relative group/input">
+                <label class="block text-[9px] font-bold text-slate-400 uppercase tracking-widest mb-1.5 flex items-center"><i class="fas fa-external-link-alt mr-2 text-slate-500"></i>URL кнопки (необяз.)</label>
+                <div class="relative flex items-center group-focus-within/input:text-blue-400">
+                  <i class="fas fa-globe absolute left-3 text-slate-500 transition-colors"></i>
+                  <input type="text" id="broadcast-btn-url" class="w-full bg-slate-900/80 border border-slate-700 rounded-xl py-2.5 pl-9 pr-3 text-sm font-medium text-white focus:border-blue-400 focus:shadow-[0_0_15px_rgba(59,130,246,0.2)] outline-none transition-all font-mono" placeholder="https://t.me/...">
+                </div>
+             </div>
+          </div>
+          
+          <button id="send-broadcast-btn" onclick="window.sendBroadcast()" class="w-full mt-2 py-3 bg-gradient-to-r from-teal-500 to-blue-500 hover:from-teal-400 hover:to-blue-400 text-slate-900 font-black text-sm rounded-xl shadow-[0_5px_20px_rgba(20,184,166,0.4)] tap-effect border border-teal-400/50 uppercase tracking-widest flex items-center justify-center relative overflow-hidden group/btn min-h-[48px]">
+             <div class="absolute inset-0 bg-white/20 transform -skew-x-12 -translate-x-full group-hover/btn:animate-[shimmer_1.5s_infinite]"></div>
+             <i class="fas fa-paper-plane mr-2 text-lg relative z-10 group-hover/btn:-translate-y-1 group-hover/btn:translate-x-1 transition-transform"></i> <span class="relative z-10 drop-shadow-sm">Отправить</span>
+          </button>
+       </div>
+    </div>
+  `;
+}
+
+window.saveAdminSettings = () => {
+  const minWith = parseFloat(document.getElementById('set-min-with').value);
+  const mRate = parseFloat(document.getElementById('set-mining-rate').value);
+  const maxHrs = parseFloat(document.getElementById('set-max-mining-hours').value);
+  const uCost = parseFloat(document.getElementById('set-upgrade-cost').value);
+  const refFix = parseFloat(document.getElementById('set-ref-fixed').value);
+  const refPercent = parseFloat(document.getElementById('set-ref-bonus').value);
+  const tonWallet = document.getElementById('set-ton-wallet').value.trim();
+  const bep20Wallet = document.getElementById('set-bep20-wallet') ? document.getElementById('set-bep20-wallet').value.trim() : '';
+  const maintenance = document.getElementById('set-maintenance').checked;
+
+  if(isNaN(minWith) || isNaN(mRate) || isNaN(maxHrs) || isNaN(uCost) || isNaN(refFix) || isNaN(refPercent)) {
+      showToast('Введите корректные числа');
+      return;
+  }
+
+  state.settings.minWithdrawal = minWith;
+  state.settings.miningRatePerHour = mRate;
+  state.settings.maxMiningTimeHours = maxHrs;
+  state.settings.upgradeBaseCost = uCost;
+  state.settings.refBonusFixed = refFix;
+  state.settings.refBonusPercent = refPercent;
+  state.settings.tonWallet = tonWallet;
+  state.settings.bep20Wallet = bep20Wallet;
+  if(bep20Wallet) state.settings.bep20Wallet = bep20Wallet;
+  state.settings.maintenanceMode = maintenance;
+  
+  state.admin.recentActivity.unshift({ time: 'Только что', text: 'Обновлены настройки системы' });
+
+  saveState();
+  console.log('Saving admin settings to state & backend...', state.settings);
+  showToast('Настройки успешно сохранены');
+  checkAccess();
+};
+
+function renderAdminSettings() {
+  const settings = state.settings;
+  const mRate = settings.miningRatePerHour !== undefined ? settings.miningRatePerHour : 0.01;
+  const maxHrs = settings.maxMiningTimeHours !== undefined ? settings.maxMiningTimeHours : 24;
+  const uCost = settings.upgradeBaseCost !== undefined ? settings.upgradeBaseCost : 5;
+  const refFix = settings.refBonusFixed !== undefined ? settings.refBonusFixed : 0.1;
+  const refPercent = settings.refBonusPercent !== undefined ? settings.refBonusPercent : 10;
+  const tonWallet = settings.tonWallet || '';
+
+  return `
+    <div class="mb-8 animate-slide-up relative z-10">
+      <h1 class="text-3xl font-black text-transparent bg-clip-text bg-gradient-to-r from-teal-400 via-blue-400 to-purple-500 tracking-tight mb-1">Настройки</h1>
+      <p class="text-slate-400 text-[10px] font-bold uppercase tracking-widest flex items-center"><i class="fas fa-cogs mr-2 text-teal-500/70"></i>Управление экономикой и системой</p>
+    </div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-5 animate-slide-up delay-75 pb-24 relative z-10">
+      
+      <!-- Mining & Upgrades -->
+      <div class="glass-premium rounded-[2rem] p-6 relative overflow-hidden group hover:border-teal-500/40 transition-all duration-500">
+         <div class="absolute -right-10 -top-10 w-40 h-40 bg-teal-500/10 rounded-full blur-3xl pointer-events-none group-hover:bg-teal-500/20 transition-colors"></div>
+         <div class="flex items-center space-x-4 mb-6 relative z-10">
+           <div class="w-12 h-12 rounded-2xl bg-teal-500/10 flex items-center justify-center text-xl text-teal-400 border border-teal-500/20 shadow-inner group-hover:scale-110 transition-transform"><i class="fas fa-hammer"></i></div>
+           <h2 class="text-lg font-black text-white">Майнинг</h2>
+         </div>
+         
+         <div class="space-y-5 relative z-10">
+            <div class="relative">
+              <label class="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">Базовая добыча (USDT/ч)</label>
+              <div class="relative flex items-center group-focus-within:text-teal-400">
+                <i class="fas fa-bolt absolute left-4 text-slate-500 transition-colors"></i>
+                <input type="number" id="set-mining-rate" value="${mRate}" step="0.001" class="w-full bg-slate-900/80 border border-slate-700 rounded-xl py-3.5 pl-11 pr-4 text-sm font-bold text-white focus:border-teal-400 focus:shadow-[0_0_15px_rgba(45,212,191,0.2)] outline-none transition-all">
+              </div>
+            </div>
+            <div class="relative">
+              <label class="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">Макс. время майнинга (Часов)</label>
+              <div class="relative flex items-center group-focus-within:text-teal-400">
+                <i class="fas fa-hourglass-half absolute left-4 text-slate-500 transition-colors"></i>
+                <input type="number" id="set-max-mining-hours" value="${maxHrs}" step="1" min="1" class="w-full bg-slate-900/80 border border-slate-700 rounded-xl py-3.5 pl-11 pr-4 text-sm font-bold text-white focus:border-teal-400 focus:shadow-[0_0_15px_rgba(45,212,191,0.2)] outline-none transition-all">
+              </div>
+            </div>
+            <div class="relative">
+              <label class="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">Базовая цена апгрейда (USDT)</label>
+              <div class="relative flex items-center group-focus-within:text-teal-400">
+                <i class="fas fa-arrow-up absolute left-4 text-slate-500 transition-colors"></i>
+                <input type="number" id="set-upgrade-cost" value="${uCost}" step="0.5" class="w-full bg-slate-900/80 border border-slate-700 rounded-xl py-3.5 pl-11 pr-4 text-sm font-bold text-white focus:border-teal-400 focus:shadow-[0_0_15px_rgba(45,212,191,0.2)] outline-none transition-all">
+              </div>
+            </div>
+         </div>
+      </div>
+
+      <!-- Referral System & Finances -->
+      <div class="flex flex-col gap-5">
+        <div class="glass-premium rounded-[2rem] p-6 relative overflow-hidden group hover:border-blue-500/40 transition-all duration-500">
+           <div class="absolute -left-10 -bottom-10 w-40 h-40 bg-blue-500/10 rounded-full blur-3xl pointer-events-none group-hover:bg-blue-500/20 transition-colors"></div>
+           <div class="flex items-center space-x-4 mb-6 relative z-10">
+             <div class="w-12 h-12 rounded-2xl bg-blue-500/10 flex items-center justify-center text-xl text-blue-400 border border-blue-500/20 shadow-inner group-hover:scale-110 transition-transform"><i class="fas fa-users"></i></div>
+             <h2 class="text-lg font-black text-white">Рефералы</h2>
+           </div>
+           
+           <div class="grid grid-cols-2 gap-4 relative z-10">
+              <div class="relative">
+                <label class="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">Фикс. бонус</label>
+                <div class="relative flex items-center group-focus-within:text-blue-400">
+                  <i class="fas fa-gift absolute left-4 text-slate-500 transition-colors"></i>
+                  <input type="number" id="set-ref-fixed" value="${refFix}" step="0.01" class="w-full bg-slate-900/80 border border-slate-700 rounded-xl py-3.5 pl-11 pr-3 text-sm font-bold text-white focus:border-blue-400 focus:shadow-[0_0_15px_rgba(59,130,246,0.2)] outline-none transition-all">
+                </div>
+              </div>
+              <div class="relative">
+                <label class="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">Процент (%)</label>
+                <div class="relative flex items-center group-focus-within:text-blue-400">
+                  <i class="fas fa-percent absolute left-4 text-slate-500 transition-colors"></i>
+                  <input type="number" id="set-ref-bonus" value="${refPercent}" step="1" class="w-full bg-slate-900/80 border border-slate-700 rounded-xl py-3.5 pl-11 pr-3 text-sm font-bold text-white focus:border-blue-400 focus:shadow-[0_0_15px_rgba(59,130,246,0.2)] outline-none transition-all">
+                </div>
+              </div>
+           </div>
+        </div>
+
+        <div class="glass-premium rounded-[2rem] p-6 relative overflow-hidden group hover:border-green-500/40 transition-all duration-500">
+           <div class="absolute -right-10 -top-10 w-40 h-40 bg-green-500/10 rounded-full blur-3xl pointer-events-none group-hover:bg-green-500/20 transition-colors"></div>
+           <div class="flex items-center space-x-4 mb-6 relative z-10">
+             <div class="w-12 h-12 rounded-2xl bg-green-500/10 flex items-center justify-center text-xl text-green-400 border border-green-500/20 shadow-inner group-hover:scale-110 transition-transform"><i class="fas fa-wallet"></i></div>
+             <h2 class="text-lg font-black text-white">Финансы</h2>
+           </div>
+           
+           <div class="space-y-5 relative z-10">
+              <div class="relative">
+                <label class="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">Мин. сумма вывода (USDT)</label>
+                <div class="relative flex items-center group-focus-within:text-green-400">
+                  <i class="fas fa-money-bill-wave absolute left-4 text-slate-500 transition-colors"></i>
+                  <input type="number" id="set-min-with" value="${settings.minWithdrawal}" class="w-full bg-slate-900/80 border border-slate-700 rounded-xl py-3.5 pl-11 pr-4 text-sm font-bold text-white focus:border-green-500 focus:shadow-[0_0_15px_rgba(34,197,94,0.2)] outline-none transition-all">
+                </div>
+              </div>
+              <div class="relative">
+                <label class="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">Кошелек TON (Tonkeeper)</label>
+                <div class="relative flex items-center group-focus-within:text-green-400">
+                  <i class="fas fa-link absolute left-4 text-slate-500 transition-colors"></i>
+                  <input type="text" id="set-ton-wallet" value="${tonWallet}" class="w-full bg-slate-900/80 border border-slate-700 rounded-xl py-3.5 pl-11 pr-4 text-sm font-mono font-bold text-white focus:border-green-500 focus:shadow-[0_0_15px_rgba(34,197,94,0.2)] outline-none transition-all" placeholder="EQ...">
+                </div>
+              </div>
+           </div>
+        </div>
+      </div>
+
+      <!-- Save Button -->
+      <button onclick="window.saveAdminSettings()" class="col-span-1 lg:col-span-2 py-4 bg-gradient-to-r from-teal-500 to-emerald-500 hover:from-teal-400 hover:to-emerald-400 text-slate-900 font-black text-sm rounded-2xl shadow-[0_10px_25px_rgba(20,184,166,0.3)] tap-effect border border-teal-400/50 uppercase tracking-widest group relative overflow-hidden flex items-center justify-center animate-slide-up delay-150">
+         <div class="absolute inset-0 bg-white/20 transform -skew-x-12 -translate-x-full group-hover:animate-[shimmer_1.5s_infinite]"></div>
+         <i class="fas fa-save mr-2 text-lg"></i> Сохранить изменения
+      </button>
+
+      <!-- Promocodes -->
+      <div class="col-span-1 lg:col-span-2 glass-premium rounded-[2rem] p-6 relative overflow-hidden group hover:border-pink-500/40 transition-all duration-500 animate-slide-up delay-200">
+         <div class="absolute -right-10 -bottom-10 w-40 h-40 bg-pink-500/10 rounded-full blur-3xl pointer-events-none group-hover:bg-pink-500/20 transition-colors"></div>
+         
+         <div class="flex justify-between items-center mb-6 relative z-10">
+           <div class="flex items-center space-x-4">
+             <div class="w-12 h-12 rounded-2xl bg-pink-500/10 flex items-center justify-center text-xl text-pink-400 border border-pink-500/20 shadow-inner group-hover:scale-110 transition-transform"><i class="fas fa-ticket-alt"></i></div>
+             <div>
+               <h2 class="text-lg font-black text-white">Промокоды</h2>
+               <p class="text-[10px] text-slate-400 font-bold uppercase tracking-widest">Раздача бонусов</p>
+             </div>
+           </div>
+           <button onclick="window.openPromoModal()" class="bg-pink-500 text-white px-4 py-2.5 rounded-xl font-bold text-xs hover:bg-pink-400 transition-all shadow-[0_5px_15px_rgba(236,72,153,0.3)] tap-effect flex items-center uppercase tracking-widest">
+             <i class="fas fa-plus mr-1.5"></i>Создать
+           </button>
+         </div>
+
+         <div class="grid grid-cols-1 md:grid-cols-2 gap-4 relative z-10">
+           ${(!state.admin.promoCodes || state.admin.promoCodes.length === 0) ? '<div class="col-span-full py-8 text-center glass-premium border border-slate-700 border-dashed rounded-2xl text-slate-500 text-sm font-medium">Нет активных промокодов</div>' : ''}
+           ${(state.admin.promoCodes || []).map(p => `
+             <div class="bg-slate-900/80 p-4 rounded-2xl border border-slate-700 flex justify-between items-center hover:border-pink-500/50 transition-colors shadow-sm group/promo">
+               <div class="flex items-center space-x-4">
+                 <div class="w-12 h-12 rounded-xl bg-pink-500/10 flex items-center justify-center text-lg text-pink-400 border border-pink-500/20 shadow-inner group-hover/promo:scale-110 transition-transform">
+                   <i class="fas fa-gift"></i>
+                 </div>
+                 <div>
+                   <p class="font-black text-white text-base font-mono tracking-widest drop-shadow-sm mb-0.5">${p.code}</p>
+                   <p class="text-[10px] text-slate-400 font-bold uppercase tracking-wider">Награда: <span class="text-teal-400 ml-0.5">+${p.reward} USDT</span> <span class="mx-1 opacity-50">•</span> <span class="text-white">${p.currentUses}/${p.maxUses || '∞'}</span></p>
+                 </div>
+               </div>
+               <button onclick="window.deletePromo('${p.code}')" class="w-10 h-10 rounded-xl bg-slate-800 text-slate-500 hover:bg-red-500/20 hover:text-red-400 border border-transparent hover:border-red-500/30 flex items-center justify-center transition-all tap-effect shrink-0 shadow-inner">
+                 <i class="fas fa-trash text-sm"></i>
+               </button>
+             </div>
+           `).join('')}
+         </div>
+      </div>
+
+      <!-- Danger Zone -->
+      <div class="col-span-1 lg:col-span-2 glass-premium border border-red-500/30 rounded-[2rem] p-6 relative overflow-hidden group hover:border-red-500/50 transition-all duration-500 animate-slide-up delay-300 mb-8">
+         <div class="absolute -left-10 -bottom-10 w-40 h-40 bg-red-500/10 rounded-full blur-3xl pointer-events-none group-hover:bg-red-500/20 transition-colors"></div>
+         
+         <div class="flex items-center space-x-4 mb-6 relative z-10">
+           <div class="w-12 h-12 rounded-2xl bg-red-500/10 flex items-center justify-center text-xl text-red-500 border border-red-500/20 shadow-inner group-hover:scale-110 group-hover:rotate-12 transition-transform"><i class="fas fa-exclamation-triangle"></i></div>
+           <div>
+             <h2 class="text-lg font-black text-red-500">Опасная зона</h2>
+             <p class="text-[10px] text-red-400/70 font-bold uppercase tracking-widest">Необратимые действия</p>
+           </div>
+         </div>
+         
+         <div class="grid grid-cols-1 md:grid-cols-2 gap-4 relative z-10">
+             <div class="flex items-center justify-between p-4 bg-slate-900/80 rounded-2xl border border-orange-500/30 hover:border-orange-500/50 transition-colors">
+               <div>
+                 <p class="font-bold text-white text-sm mb-0.5 flex items-center"><i class="fas fa-wrench text-orange-400 mr-2"></i>Техобслуживание</p>
+                 <p class="text-[10px] text-slate-500 uppercase font-bold tracking-widest">Блок входа для всех</p>
+               </div>
+               <label class="relative inline-flex items-center cursor-pointer tap-effect shadow-inner">
+                 <input type="checkbox" id="set-maintenance" class="sr-only peer" ${settings.maintenanceMode ? 'checked' : ''}>
+                 <div class="w-11 h-6 bg-slate-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-slate-400 after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-orange-500 peer-checked:after:bg-white border border-slate-700"></div>
+               </label>
+             </div>
+
+             <button onclick="window.resetTotalPaid()" class="w-full p-4 bg-orange-500/10 hover:bg-orange-500/20 text-orange-400 border border-orange-500/30 font-black text-xs rounded-2xl transition-all tap-effect shadow-sm flex items-center justify-center uppercase tracking-widest">
+               <i class="fas fa-history mr-2 text-lg"></i> Обнулить стату "Выплачено"
+             </button>
+             
+             <button id="reset-db-btn" onclick="window.resetDatabase()" class="w-full md:col-span-2 p-4 bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/30 font-black text-xs rounded-2xl transition-all tap-effect shadow-sm flex items-center justify-center uppercase tracking-widest">
+               <i class="fas fa-bomb mr-2 text-lg"></i> Полный сброс БД (Удалить всё)
+             </button>
+         </div>
+      </div>
+      
+    </div>
+  `;
+}
+
+window.resetTotalPaid = async () => {
+  if (!confirm("Вы уверены? Это удалит историю всех успешных выплат у всех пользователей и сбросит счетчик до 0.")) return;
+  
+  const allDocs = await User.find({});
+  for (let doc of allDocs) {
+    if (doc.data && doc.data.withdrawals) {
+      doc.data.withdrawals = doc.data.withdrawals.filter(w => w.status !== 'completed');
+      await User.updateOne({ id: doc.id }, { $set: { data: doc.data } });
+    }
+  }
+  
+  if (state.withdrawals) {
+    state.withdrawals = state.withdrawals.filter(w => w.status !== 'completed');
+  }
+  
+  state.admin.stats.totalPaid = 0;
+  saveState();
+  await syncAdminData();
+  
+  showToast("Статистика выплат успешно обнулена");
+};
+
+window.resetDatabase = async () => {
+  if (!confirm("ВНИМАНИЕ! Вы уверены, что хотите ПОЛНОСТЬЮ ОБНУЛИТЬ БАЗУ ДАННЫХ? Все пользователи, балансы, рефералы и настройки будут удалены безвозвратно.")) return;
+  if (!confirm("ЭТО ДЕЙСТВИЕ НЕОБРАТИМО! Вы точно хотите удалить всё?")) return;
+
+  const btn = document.getElementById('reset-db-btn');
+  if (btn) btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>Удаление...';
+
+  try {
+      const allDocs = await User.find({});
+      for (let doc of allDocs) {
+          await User.deleteOne({ id: doc.id });
+      }
+      localStorage.clear();
+      showToast("База данных успешно обнулена! Перезагрузка...");
+      setTimeout(() => {
+          window.location.reload();
+      }, 2000);
+  } catch(e) {
+      console.error(e);
+      showToast("Ошибка при обнулении БД");
+      if (btn) btn.innerHTML = '<i class="fas fa-bomb mr-2"></i>Полный сброс БД (Удалить всё)';
+  }
+};
+
+window.openPromoModal = () => {
+  triggerHaptic('medium');
+  modalContent.innerHTML = `
+    <h3 class="text-xl font-bold text-white mb-4">Новый промокод</h3>
+    <div class="space-y-4 mb-6">
+      <div>
+        <label class="block text-xs text-slate-400 mb-2">Код (буквы и цифры)</label>
+        <input type="text" id="new-promo-code" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-3 text-white text-sm uppercase focus:border-teal-500 outline-none font-mono" placeholder="Например: BONUS100">
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs text-slate-400 mb-2">Награда (USDT)</label>
+          <input type="number" id="new-promo-reward" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-3 text-white text-sm focus:border-teal-500 outline-none" placeholder="1.0" step="0.1" min="0">
+        </div>
+        <div>
+          <label class="block text-xs text-slate-400 mb-2">Макс. активаций</label>
+          <input type="number" id="new-promo-max" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-3 text-white text-sm focus:border-teal-500 outline-none" placeholder="0 = Безлимит" min="0">
+        </div>
+      </div>
+    </div>
+    <div class="flex space-x-3">
+      <button onclick="window.closeModal()" class="flex-1 py-3 bg-slate-800 text-white rounded-xl font-bold text-sm tap-effect">Отмена</button>
+      <button onclick="window.savePromo()" class="flex-1 py-3 bg-teal-500 text-slate-900 rounded-xl font-bold text-sm shadow-lg shadow-teal-500/20 tap-effect">Создать</button>
+    </div>
+  `;
+  modalOverlay.classList.remove('hidden');
+  setTimeout(() => { 
+    modalOverlay.classList.remove('opacity-0'); 
+    modalContent.classList.remove('scale-95'); 
+    modalContent.classList.add('animate-pop-in'); 
+  }, 10);
+};
+
+window.savePromo = () => {
+  const code = document.getElementById('new-promo-code').value.trim().toUpperCase();
+  const reward = parseFloat(document.getElementById('new-promo-reward').value);
+  const maxUses = parseInt(document.getElementById('new-promo-max').value) || 0;
+
+  if (!code || isNaN(reward) || reward <= 0) {
+    return showToast("Заполните все поля корректно");
+  }
+
+  if (!state.admin.promoCodes) state.admin.promoCodes = [];
+  
+  if (state.admin.promoCodes.find(p => p.code === code)) {
+    return showToast("Такой код уже существует");
+  }
+
+  state.admin.promoCodes.push({
+    code,
+    reward,
+    maxUses,
+    currentUses: 0,
+    active: true
+  });
+
+  saveState();
+  window.closeModal();
+  renderAdminTab('settings');
+  showToast("Промокод успешно создан");
+};
+
+window.deletePromo = (code) => {
+  if (confirm("Вы уверены, что хотите удалить этот промокод?")) {
+    state.admin.promoCodes = state.admin.promoCodes.filter(p => p.code !== code);
+    saveState();
+    renderAdminTab('settings');
+    showToast("Промокод удален");
+  }
+};
+
+window.openLeaderboardModal = async () => {
+  modalContent.innerHTML = '<div class="flex justify-center py-8"><i class="fas fa-circle-notch fa-spin text-teal-400 text-3xl"></i></div>';
+  modalOverlay.classList.remove('hidden');
+  setTimeout(() => { modalOverlay.classList.remove('opacity-0'); modalContent.classList.remove('scale-95'); modalContent.classList.add('animate-pop-in'); }, 10);
+
+  try {
+    const allDocs = await User.find({});
+    let leaders = allDocs.map(doc => {
+        const friends = doc.data?.friends || [];
+        const uData = doc.data?.user || {};
+        const refEarned = friends.reduce((sum, f) => sum + (f.earned || 0), 0);
+        return {
+            id: doc.id,
+            name: uData.firstName || uData.username || ('User ' + doc.id),
+            avatar: uData.photoUrl || null,
+            refCount: friends.length,
+            refEarned: refEarned
+        };
+    }).filter(u => u.refCount > 0);
+
+    leaders.sort((a, b) => b.refCount - a.refCount);
+    const top10 = leaders.slice(0, 10);
+
+    let html = '<div class="flex justify-between items-center mb-4"><h3 class="text-base font-bold text-white flex items-center"><i class="fas fa-trophy text-yellow-400 mr-2 text-lg"></i> Топ-10 рефоводов</h3><button onclick="window.closeModal()" class="text-slate-400 hover:text-white p-1 text-lg"><i class="fas fa-times"></i></button></div>';
+    html += '<div class="space-y-2 max-h-[60vh] overflow-y-auto hide-scrollbar pb-2">';
+
+    if (top10.length === 0) {
+        html += '<div class="text-center text-slate-500 text-xs py-6 bg-slate-850 rounded-xl border border-slate-700/50">Пока никто не пригласил друзей.<br>Будьте первыми!</div>';
+    } else {
+        top10.forEach((u, index) => {
+            let rankIcon = ''; let rankColor = 'text-slate-400'; let bgHighlight = 'bg-slate-850 border-slate-700/50';
+            if (index === 0) { rankIcon = '👑'; rankColor = 'text-yellow-400'; bgHighlight = 'bg-yellow-500/10 border-yellow-500/30'; }
+            else if (index === 1) { rankIcon = '🥈'; rankColor = 'text-slate-300'; bgHighlight = 'bg-slate-300/10 border-slate-300/30'; }
+            else if (index === 2) { rankIcon = '🥉'; rankColor = 'text-orange-400'; bgHighlight = 'bg-orange-500/10 border-orange-500/30'; }
+            else { rankIcon = '#' + (index + 1); }
+
+            const isMe = u.id === currentUser.id;
+            if (isMe && index > 2) bgHighlight = 'bg-teal-500/10 border-teal-500/30';
+
+            html += `
+                <div class="p-2 rounded-xl border ${bgHighlight} flex items-center justify-between transition-colors">
+                    <div class="flex items-center space-x-2.5">
+                        <div class="w-5 text-center font-bold text-[11px] ${rankColor} shrink-0">${rankIcon}</div>
+                        <div class="w-8 h-8 rounded-full bg-slate-700 flex items-center justify-center text-[10px] font-bold text-white border border-slate-600 overflow-hidden shrink-0 shadow-inner">
+                            ${u.avatar ? `<img src="${u.avatar}" class="w-full h-full object-cover">` : u.name.charAt(0)}
+                        </div>
+                        <div class="min-w-0 pr-2">
+                            <p class="font-bold text-[11px] text-white truncate max-w-[110px]">${u.name} ${isMe ? '<span class="text-[8px] text-teal-400 ml-1 font-normal">(Вы)</span>' : ''}</p>
+                            <p class="text-[8px] text-slate-400 mt-0.5">Доход: <span class="text-teal-400">+${u.refEarned.toFixed(2)}</span></p>
+                        </div>
+                    </div>
+                    <div class="text-right shrink-0 bg-slate-900/50 px-2 py-1 rounded-lg border border-slate-700/50">
+                        <p class="text-white font-bold text-[11px]">${u.refCount}</p>
+                        <p class="text-[6px] text-slate-500 uppercase mt-0.5 tracking-wider">друзей</p>
+                    </div>
+                </div>
+            `;
+        });
+    }
+
+    html += '</div><button onclick="window.closeModal()" class="w-full py-2.5 mt-2 bg-slate-800 text-white rounded-xl font-bold text-xs tap-effect hover:bg-slate-700 transition-colors">Закрыть</button>';
+    modalContent.innerHTML = html;
+  } catch (err) {
+    modalContent.innerHTML = '<div class="p-4 text-center text-red-400 text-xs">Ошибка загрузки данных</div><button onclick="window.closeModal()" class="w-full py-2.5 mt-4 bg-slate-800 text-white rounded-xl font-bold text-xs">Закрыть</button>';
+  }
+};
+
+// ==========================================
+// ANIMATIONS
+// ==========================================
+function startHomeParticles() {
+  const layer = document.getElementById('particles-layer');
+  if (!layer) return;
+  layer.innerHTML = '';
+  for (let i = 0; i < 20; i++) {
+    createParticle(layer);
+  }
+}
+
+function createParticle(layer) {
+  if (!layer || document.getElementById('particles-layer') !== layer) return;
+  const p = document.createElement('div');
+  const size = Math.random() * 4 + 2;
+  const isCoin = Math.random() > 0.85;
+  
+  p.className = 'particle';
+  if (isCoin) {
+     p.innerHTML = '<i class="fas fa-coins text-teal-500/30"></i>';
+     p.style.fontSize = `${size * 3}px`;
+  } else {
+     p.style.width = `${size}px`;
+     p.style.height = `${size}px`;
+     p.style.backgroundColor = Math.random() > 0.5 ? 'rgba(45,212,191,0.5)' : 'rgba(168,85,247,0.5)';
+     p.style.borderRadius = '50%';
+     p.style.boxShadow = `0 0 ${size*2}px currentColor`;
+  }
+  
+  p.style.left = `${Math.random() * 100}%`;
+  p.style.bottom = '-20px';
+  const duration = Math.random() * 5 + 4;
+  p.style.animationDuration = `${duration}s`;
+  p.style.animationDelay = `${Math.random() * 5}s`;
+  
+  layer.appendChild(p);
+  setTimeout(() => {
+    if (p.parentNode === layer && currentTab === 'home') {
+      p.remove();
+      createParticle(layer);
+    } else if (p.parentNode) {
+      p.remove();
+    }
+  }, (duration + 5) * 1000);
+}
+
+function spawnCoins(x, y, targetEl) {
+  let targetRect = { left: window.innerWidth / 2, top: 50, width: 0, height: 0 };
+  if (targetEl) targetRect = targetEl.getBoundingClientRect();
+  
+  const targetX = targetRect.left + targetRect.width / 2;
+  const targetY = targetRect.top + targetRect.height / 2;
+  
+  for (let i = 0; i < 12; i++) {
+    const coin = document.createElement('div');
+    coin.className = 'coin-anim flex items-center justify-center';
+    coin.innerHTML = '<i class="fas fa-coins text-yellow-400 drop-shadow-[0_0_8px_rgba(250,204,21,0.8)]"></i>';
+    coin.style.left = `${x - 12}px`;
+    coin.style.top = `${y - 12}px`;
+    
+    // Calculate random target position near the balance
+    const randomTx = (targetX - x) + (Math.random() - 0.5) * 40;
+    const randomTy = (targetY - y) + (Math.random() - 0.5) * 40;
+    
+    coin.style.setProperty('--tx', `${randomTx}px`);
+    coin.style.setProperty('--ty', `${randomTy}px`);
+    coin.style.animationDelay = `${Math.random() * 0.1}s`;
+    
+    document.body.appendChild(coin);
+    setTimeout(() => coin.remove(), 1000);
+  }
+}
+
+// Start app
+document.addEventListener('DOMContentLoaded', initApp);
